@@ -8,7 +8,7 @@ A Raspberry Pi-based SpotMicro quadruped robot with inverse kinematics, real-tim
 
 <!-- Drop your GIF/image in the docs/ folder and update the filename below -->
 <p align="center">
-  <img src="docs/demo.gif" alt="MicroSpot Robot" width="500">
+  <img src="docs/spotmicro.gif" alt="MicroSpot Robot" width="500">
 </p>
 
 ## Features
