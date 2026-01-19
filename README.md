@@ -6,8 +6,9 @@
 
 A Raspberry Pi-based SpotMicro quadruped robot with inverse kinematics, real-time balance control, and PS4/PS5 controller support.
 
+<!-- Drop your GIF/image in the docs/ folder and update the filename below -->
 <p align="center">
-  <img src="docs/spotmicro.jpg" alt="MicroSpot Robot" width="400">
+  <img src="docs/demo.gif" alt="MicroSpot Robot" width="500">
 </p>
 
 ## Features
