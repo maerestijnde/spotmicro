@@ -1,0 +1,19 @@
+{
+  "version": "1.0",
+  "last_updated": null,
+  "gait": {
+    "cycle_time": 1.0,
+    "step_height": 30,
+    "step_length": 15,
+    "speed": 1.0
+  },
+  "balance": {
+    "kp": 0.15,
+    "pitch_gain": 1.0,
+    "roll_gain": 1.0
+  },
+  "stand": {
+    "knee_bend": 22,
+    "ankle_compensation": 1.3
+  }
+}
