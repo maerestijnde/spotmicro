@@ -101,6 +101,10 @@ except Exception as e:
     log_init.warning(f"Kinematics not available: {e}")
 
 # Hardware initialization
+HW = False
+pca_front = None
+pca_rear = None
+
 try:
     import board
     import busio
@@ -108,14 +112,47 @@ try:
     from adafruit_motor import servo
 
     i2c = busio.I2C(board.SCL, board.SDA)
-    pca = PCA9685(i2c)
-    pca.frequency = 50
-    HW = True
-    log_init.info("Hardware initialized (PCA9685)")
+
+    # Dual PCA9685 setup:
+    # - PCA #1 @ 0x41: Front legs (FL, FR) - channels 0-5
+    # - PCA #2 @ 0x40: Rear legs (RL, RR) - channels 0-5
+
+    # Initialize front PCA (0x41)
+    try:
+        pca_front = PCA9685(i2c, address=0x41)
+        pca_front.frequency = 50
+        log_init.info("✓ PCA9685 @ 0x41 (front legs FL/FR) initialized")
+    except Exception as e:
+        log_init.error(f"✗ PCA9685 @ 0x41 (front legs) NOT FOUND: {e}")
+        pca_front = None
+
+    # Initialize rear PCA (0x40)
+    try:
+        pca_rear = PCA9685(i2c, address=0x40)
+        pca_rear.frequency = 50
+        log_init.info("✓ PCA9685 @ 0x40 (rear legs RL/RR) initialized")
+    except Exception as e:
+        log_init.error(f"✗ PCA9685 @ 0x40 (rear legs) NOT FOUND: {e}")
+        pca_rear = None
+
+    # Check if both boards are available
+    if pca_front and pca_rear:
+        HW = True
+        log_init.info("Hardware initialized (Dual PCA9685: 0x41 front, 0x40 rear)")
+    else:
+        HW = False
+        missing = []
+        if not pca_front:
+            missing.append("0x41 (front)")
+        if not pca_rear:
+            missing.append("0x40 (rear)")
+        log_init.warning(f"Partial hardware - missing PCA: {', '.join(missing)} - simulation mode")
+
 except Exception as e:
     HW = False
-    pca = None
-    log_init.warning("No hardware - simulation mode")
+    pca_front = None
+    pca_rear = None
+    log_init.warning(f"No hardware - simulation mode: {e}")
 
 # Configuration
 BASE_DIR = Path(__file__).parent
@@ -147,7 +184,23 @@ QUAD_CONFIG = {
 
 # Servo state
 servos = {}
-servo_angles = {i: 90 for i in range(16)}
+servo_angles = {i: 90 for i in range(12)}  # Only 12 servos (0-11)
+
+
+def get_pca_and_channel(logical_channel: int):
+    """
+    Map logical channel (0-11) to PCA board and physical channel.
+
+    Logical channels 0-5 (FL, FR) -> PCA @ 0x40, physical channels 0-5
+    Logical channels 6-11 (RL, RR) -> PCA @ 0x41, physical channels 0-5
+
+    Returns:
+        tuple: (pca_board, physical_channel)
+    """
+    if logical_channel < 6:
+        return pca_front, logical_channel
+    else:
+        return pca_rear, logical_channel - 6
 
 # Calibration system
 class CalibrationProfile:
@@ -425,15 +478,17 @@ def init_servos():
         for leg_id, config in QUAD_CONFIG.items():
             for i, channel in enumerate(config["channels"]):
                 key = f"{leg_id}_{i}"
+                # Get the correct PCA board and physical channel
+                pca_board, physical_channel = get_pca_and_channel(channel)
                 servos[key] = servo.Servo(
-                    pca.channels[channel],
+                    pca_board.channels[physical_channel],
                     min_pulse=SERVO_PARAMS["min_pulse"],
                     max_pulse=SERVO_PARAMS["max_pulse"],
                     actuation_range=SERVO_PARAMS["actuation_range"]
                 )
                 # Don't set angle yet - wait for goto_calibrated_neutrals
                 servo_angles[channel] = 90
-        print(f"✓ Initialized {len(servos)} servos")
+        print(f"✓ Initialized {len(servos)} servos (dual PCA9685)")
     except Exception as e:
         print(f"✗ Servo init error: {e}")
 
@@ -571,15 +626,18 @@ def disable_servo(channel):
         print(f"Simulation: would disable servo {channel}")
         return True
 
+    # Get the correct PCA board and physical channel
+    pca_board, physical_channel = get_pca_and_channel(channel)
+
     try:
         # PCA9685 register addresses:
         # LED0_ON_L = 0x06, LED0_ON_H = 0x07, LED0_OFF_L = 0x08, LED0_OFF_H = 0x09
         # Each channel is 4 bytes apart
         # Setting bit 4 (0x10) in OFF_H register enables "full off" mode
-        off_h_reg = 0x09 + 4 * channel  # OFF_H register for this channel
+        off_h_reg = 0x09 + 4 * physical_channel  # OFF_H register for this channel
 
         # Use the i2c_device context manager to write directly
-        with pca.i2c_device as i2c:
+        with pca_board.i2c_device as i2c:
             i2c.write(bytes([off_h_reg, 0x10]))  # Set bit 4 (full off)
 
         print(f"✓ Servo {channel} disabled (full off bit set)")
@@ -590,8 +648,8 @@ def disable_servo(channel):
         try:
             # Set all ON/OFF registers to disable output completely
             # ON_L=0, ON_H=0, OFF_L=0, OFF_H=0x10 (full off)
-            base_reg = 0x06 + 4 * channel
-            with pca.i2c_device as i2c:
+            base_reg = 0x06 + 4 * physical_channel
+            with pca_board.i2c_device as i2c:
                 i2c.write(bytes([base_reg, 0x00, 0x00, 0x00, 0x10]))
             print(f"✓ Servo {channel} disabled via full register write")
             return True
@@ -599,7 +657,7 @@ def disable_servo(channel):
             print(f"✗ Fallback also failed: {e2}")
             # Last resort: duty_cycle = 0 (still sends tiny pulse but minimal)
             try:
-                pca.channels[channel].duty_cycle = 0
+                pca_board.channels[physical_channel].duty_cycle = 0
                 print(f"  Last resort: duty_cycle = 0")
                 return True
             except:
@@ -807,10 +865,16 @@ def reset_all():
     print("✓ Reset to 90°")
 
 def cleanup():
-    if HW and pca:
+    if HW:
         print("Shutting down...")
         try:
-            pca.deinit()
+            if pca_front:
+                pca_front.deinit()
+        except:
+            pass
+        try:
+            if pca_rear:
+                pca_rear.deinit()
         except:
             pass
     print("Shutdown complete")

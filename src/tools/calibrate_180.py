@@ -14,10 +14,26 @@ from pathlib import Path
 # Calibration file path (one level up from tools/)
 CALIBRATION_FILE = Path(__file__).parent.parent / "calibration.json"
 
-# Hardware init
+# Hardware init - Dual PCA9685 setup
 i2c = busio.I2C(SCL, SDA)
-pca = PCA9685(i2c)
-pca.frequency = 50
+pca_front = PCA9685(i2c, address=0x41)  # Front legs (FL, FR) - channels 0-5
+pca_front.frequency = 50
+pca_rear = PCA9685(i2c, address=0x40)   # Rear legs (RL, RR) - channels 0-5
+pca_rear.frequency = 50
+
+
+def get_pca_and_channel(logical_channel: int):
+    """
+    Map logical channel (0-11) to PCA board and physical channel.
+
+    Logical channels 0-5 (FL, FR) -> PCA @ 0x41, physical channels 0-5
+    Logical channels 6-11 (RL, RR) -> PCA @ 0x40, physical channels 0-5
+    """
+    if logical_channel < 6:
+        return pca_front, logical_channel
+    else:
+        return pca_rear, logical_channel - 6
+
 
 # Servo config voor MG996R
 SERVO_CONFIG = {
@@ -35,8 +51,10 @@ CHANNELS = {
 }
 
 def create_servo(channel):
+    """Create servo object for logical channel (0-11)"""
+    pca_board, physical_channel = get_pca_and_channel(channel)
     return servo.Servo(
-        pca.channels[channel],
+        pca_board.channels[physical_channel],
         min_pulse=SERVO_CONFIG["min_pulse"],
         max_pulse=SERVO_CONFIG["max_pulse"],
         actuation_range=SERVO_CONFIG["actuation_range"]
@@ -227,4 +245,5 @@ if __name__ == "__main__":
         print("  python3 calibrate_180.py verify  - Controleer calibration.json")
         print("  python3 calibrate_180.py <ch>    - Kalibreer een channel (0-11)")
 
-    pca.deinit()
+    pca_front.deinit()
+    pca_rear.deinit()

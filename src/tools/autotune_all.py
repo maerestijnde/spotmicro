@@ -14,10 +14,26 @@ import sys
 import json
 from pathlib import Path
 
-# Hardware init
+# Hardware init - Dual PCA9685 setup
 i2c = busio.I2C(board.SCL, board.SDA)
-pca = PCA9685(i2c)
-pca.frequency = 50
+pca_front = PCA9685(i2c, address=0x41)  # Front legs (FL, FR) - channels 0-5
+pca_front.frequency = 50
+pca_rear = PCA9685(i2c, address=0x40)   # Rear legs (RL, RR) - channels 0-5
+pca_rear.frequency = 50
+
+
+def get_pca_and_channel(logical_channel: int):
+    """
+    Map logical channel (0-11) to PCA board and physical channel.
+
+    Logical channels 0-5 (FL, FR) -> PCA @ 0x41, physical channels 0-5
+    Logical channels 6-11 (RL, RR) -> PCA @ 0x40, physical channels 0-5
+    """
+    if logical_channel < 6:
+        return pca_front, logical_channel
+    else:
+        return pca_rear, logical_channel - 6
+
 
 # Calibration file path (one level up from tools/)
 CALIBRATION_FILE = Path(__file__).parent.parent / "calibration.json"
@@ -50,10 +66,11 @@ SIDE_CONFIG = {
 servos_cache = {}
 
 def get_servo(channel):
-    """Get or create servo object for channel"""
+    """Get or create servo object for logical channel (0-11)"""
     if channel not in servos_cache:
+        pca_board, physical_channel = get_pca_and_channel(channel)
         servos_cache[channel] = servo.Servo(
-            pca.channels[channel],
+            pca_board.channels[physical_channel],
             min_pulse=500,
             max_pulse=2500,
             actuation_range=180  # MG996R 180° servos
@@ -495,6 +512,12 @@ def print_servo_menu():
         print(f"{channels['ankle']:<4} {leg_id:<6} {'ankle':<8} {name} Ankle")
     print("="*60)
 
+def cleanup_pca():
+    """Cleanup both PCA boards"""
+    pca_front.deinit()
+    pca_rear.deinit()
+
+
 def main():
     print("="*60)
     print("  AUTOTUNE ALL SERVOS - MicroSpot Calibratie Tool")
@@ -505,7 +528,7 @@ def main():
     print("  l) LEG   - calibreer hele poot (hip->knee->ankle)")
     print("  a) ALL   - calibreer alle 12 servo's")
     print("  t) TEST  - zet alle servo's naar neutrale positie")
-    print("  r) RAW   - zet alle servo's naar 135° (raw test)")
+    print("  r) RAW   - zet alle servo's naar 90° (raw test)")
     print("  q) Quit")
     print()
 
@@ -513,7 +536,7 @@ def main():
 
     if mode == 'q':
         print("Bye!")
-        pca.deinit()
+        cleanup_pca()
         sys.exit(0)
 
     if mode == 'r':
@@ -522,7 +545,7 @@ def main():
             set_servo_angle(ch, 90)
             print(f"  Ch{ch}: 90°")
         input("\nDruk ENTER om af te sluiten...")
-        pca.deinit()
+        cleanup_pca()
         sys.exit(0)
 
     if mode == 't':
@@ -531,7 +554,7 @@ def main():
             test_neutrals(calib)
         else:
             print("Geen calibration.json gevonden!")
-        pca.deinit()
+        cleanup_pca()
         sys.exit(0)
 
     if mode == 's':
@@ -541,11 +564,11 @@ def main():
             channel = int(input("\nChannel nummer [0-11]: ").strip())
             if channel < 0 or channel > 11:
                 print("Ongeldig channel!")
-                pca.deinit()
+                cleanup_pca()
                 sys.exit(1)
         except ValueError:
             print("Ongeldig nummer!")
-            pca.deinit()
+            cleanup_pca()
             sys.exit(1)
 
         calibrate_single_servo(channel)
@@ -562,7 +585,7 @@ def main():
             print(f"  Offset: {s['offset']}")
             print(f"{'='*60}")
 
-        pca.deinit()
+        cleanup_pca()
         sys.exit(0)
 
     if mode == 'l':
@@ -574,7 +597,7 @@ def main():
         choice = input("\nKeuze [1-4]: ").strip()
         if choice not in LEGS:
             print("Ongeldige keuze!")
-            pca.deinit()
+            cleanup_pca()
             sys.exit(1)
 
         legs_to_calibrate = [choice]
@@ -585,7 +608,7 @@ def main():
 
     else:
         print("Ongeldige modus!")
-        pca.deinit()
+        cleanup_pca()
         sys.exit(1)
 
     # Calibrate selected legs
@@ -640,12 +663,13 @@ def main():
 
     print(f"\n{'='*60}")
     print("Done!")
-    pca.deinit()
+    cleanup_pca()
+
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
         print("\n\nAfgebroken door gebruiker")
-        pca.deinit()
+        cleanup_pca()
         sys.exit(0)

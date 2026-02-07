@@ -9,10 +9,32 @@ import time
 import select
 import sys
 
-# Hardware init
+# Hardware init - Dual PCA9685 setup
 i2c = busio.I2C(board.SCL, board.SDA)
-pca = PCA9685(i2c)
-pca.frequency = 50
+pca_front = PCA9685(i2c, address=0x41)  # Front legs (FL, FR) - channels 0-5
+pca_front.frequency = 50
+pca_rear = PCA9685(i2c, address=0x40)   # Rear legs (RL, RR) - channels 0-5
+pca_rear.frequency = 50
+
+
+def get_pca_and_channel(logical_channel: int):
+    """
+    Map logical channel (0-11) to PCA board and physical channel.
+
+    Logical channels 0-5 (FL, FR) -> PCA @ 0x41, physical channels 0-5
+    Logical channels 6-11 (RL, RR) -> PCA @ 0x40, physical channels 0-5
+    """
+    if logical_channel < 6:
+        return pca_front, logical_channel
+    else:
+        return pca_rear, logical_channel - 6
+
+
+def create_servo(channel):
+    """Create servo object for logical channel (0-11)"""
+    pca_board, physical_channel = get_pca_and_channel(channel)
+    return servo.Servo(pca_board.channels[physical_channel], min_pulse=500, max_pulse=2500, actuation_range=180)
+
 
 # Knie servo channels met bijbehorende enkel en enkel forward positie
 # (knie_ch, enkel_ch, enkel_forward_angle, naam)
@@ -38,8 +60,9 @@ if choice not in KNEES:
 
 SERVO_CHANNEL, ANKLE_CHANNEL, ANKLE_FORWARD, KNEE_NAME = KNEES[choice]
 
-srv = servo.Servo(pca.channels[SERVO_CHANNEL], min_pulse=500, max_pulse=2500, actuation_range=180)
-ankle_srv = servo.Servo(pca.channels[ANKLE_CHANNEL], min_pulse=500, max_pulse=2500, actuation_range=180)
+# Create servo objects using dual PCA mapping
+srv = create_servo(SERVO_CHANNEL)
+ankle_srv = create_servo(ANKLE_CHANNEL)
 
 print()
 print(f"=== AUTOTUNE SERVO {SERVO_CHANNEL} ({KNEE_NAME}) ===")
@@ -168,5 +191,6 @@ print(f'''
     }}
 ''')
 
-pca.deinit()
+pca_front.deinit()
+pca_rear.deinit()
 print("Done!")
