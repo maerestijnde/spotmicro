@@ -98,8 +98,6 @@ Thumbs.db
 
 # Claude Code setup (private)
 .claude/
-claude.md
-CLAUDE.md
 
 # Project specific
 *.log
