@@ -72,7 +72,6 @@ def render_imu_page(api_url: str):
             try:
                 requests.post(f"{api_url}/api/balance/calibrate", timeout=5)
                 st.success("Calibrated!")
-                time.sleep(0.5)
                 st.rerun()
             except Exception as e:
                 st.error(f"Error: {e}")

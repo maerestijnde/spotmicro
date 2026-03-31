@@ -1,11 +1,19 @@
 #!/bin/bash
 # MicroSpot - Start backend + UI + PS4 Controller
-# Usage: ./start.sh [--dash]
-#   --dash    Use Dash UI instead of Streamlit (better real-time)
+# Usage: ./start.sh [--orbit] [--nicegui] [--dash]
+#   --orbit     Use Orbit UI (modern NiceGUI dashboard)
+#   --nicegui   Use NiceGUI UI (WebSocket-driven, 3D via Three.js)
+#   --dash      Use Dash UI instead of Streamlit (better real-time)
 # Press Ctrl+C to stop all services
 
 USE_DASH=false
-if [ "$1" == "--dash" ]; then
+USE_NICEGUI=false
+USE_ORBIT=false
+if [ "$1" == "--orbit" ]; then
+    USE_ORBIT=true
+elif [ "$1" == "--nicegui" ]; then
+    USE_NICEGUI=true
+elif [ "$1" == "--dash" ]; then
     USE_DASH=true
 fi
 
@@ -63,7 +71,27 @@ fi
 echo ""
 
 # Start UI (foreground)
-if [ "$USE_DASH" == "true" ]; then
+if [ "$USE_ORBIT" == "true" ]; then
+    echo "Starting Orbit UI (port 8502)..."
+    echo ""
+    echo "========================================"
+    echo "  Open: http://microspot:8502"
+    echo "  API:  http://microspot:8000/docs"
+    echo "  PS4:  Connect controller via Bluetooth"
+    echo "========================================"
+    echo ""
+    python3 orbit_app.py
+elif [ "$USE_NICEGUI" == "true" ]; then
+    echo "Starting NiceGUI UI (port 8502)..."
+    echo ""
+    echo "========================================"
+    echo "  Open: http://microspot:8502"
+    echo "  API:  http://microspot:8000/docs"
+    echo "  PS4:  Connect controller via Bluetooth"
+    echo "========================================"
+    echo ""
+    python3 nicegui_app.py
+elif [ "$USE_DASH" == "true" ]; then
     echo "Starting Dash UI (port 8050)..."
     echo ""
     echo "========================================"
@@ -80,7 +108,7 @@ else
     echo "  Open: http://microspot:8501"
     echo "  API:  http://microspot:8000/docs"
     echo "  PS4:  Connect controller via Bluetooth"
-    echo "  TIP:  Use --dash for better real-time"
+    echo "  TIP:  Use --nicegui or --dash for better real-time"
     echo "========================================"
     echo ""
     streamlit run app.py --server.port 8501 --server.headless true

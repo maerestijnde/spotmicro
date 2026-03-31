@@ -11,6 +11,7 @@ import sys
 import atexit
 import json
 import time
+import asyncio
 import numpy as np
 from pathlib import Path
 from math import degrees, radians, cos, pi
@@ -72,6 +73,7 @@ log_servo = logging.getLogger("microspot.servo")
 log_gait = logging.getLogger("microspot.gait")
 log_imu = logging.getLogger("microspot.imu")
 log_api = logging.getLogger("microspot.api")
+log_tuning = logging.getLogger("microspot.tuning")
 
 # Import gait controller
 try:
@@ -90,6 +92,15 @@ try:
 except Exception as e:
     STABILITY_AVAILABLE = False
     log_init.warning(f"Stability monitor not available: {e}")
+
+# Import data logger
+try:
+    from data_logger import DataLogger
+    DATA_LOGGER_AVAILABLE = True
+    log_init.info("Data logger loaded")
+except Exception as e:
+    DATA_LOGGER_AVAILABLE = False
+    log_init.warning(f"Data logger not available: {e}")
 
 # Import Spot Micro Kinematics
 try:
@@ -292,6 +303,19 @@ gait_controller = None
 
 # Stability monitor
 stability_monitor = None
+
+# Data logger
+data_logger = None
+
+# In-memory event buffer for real-time UI overlay (independent of recording)
+from collections import deque as _deque
+_recent_events = _deque(maxlen=100)
+
+def _emit_event(tag: str):
+    """Log event to both recording (if active) and in-memory buffer for UI."""
+    _recent_events.append({"t": time.time(), "tag": tag})
+    if data_logger and data_logger.is_recording():
+        data_logger.log_event(tag)
 
 # Custom poses storage
 custom_poses = {}
@@ -515,8 +539,39 @@ def goto_calibrated_neutrals():
             print(f"  Ch{channel:2d} (unconfigured): → 90°")
     print(f"{'='*60}\n")
 
+_pca_check_counter = 0
+_PCA_CHECK_INTERVAL = 50  # Check every ~50 servo writes (~1s at 50Hz gait)
+
+def _check_pca_health():
+    """Detect and recover PCA9685 brownout-reset (chip reverts to sleep mode)."""
+    if not HW:
+        return
+    for pca, addr, name in [(pca_front, 0x41, "front"), (pca_rear, 0x40, "rear")]:
+        if pca is None:
+            continue
+        try:
+            buf = bytearray(1)
+            with pca.i2c_device as i2c:
+                i2c.write_then_readinto(bytes([0x00]), buf)
+            if buf[0] & 0x10:  # SLEEP bit set = brownout reset
+                # Must clear SLEEP first - Adafruit's frequency setter preserves
+                # old MODE1 which includes the SLEEP bit from brownout state
+                with pca.i2c_device as i2c:
+                    i2c.write(bytes([0x00, 0x00]))  # MODE1 = 0x00, clear SLEEP
+                time.sleep(0.005)  # Wait for oscillator to stabilize
+                pca.frequency = 50
+                log.warning(f"PCA9685 @ 0x{addr:02x} ({name}) brownout detected - re-initialized")
+        except Exception as e:
+            log.error(f"PCA health check 0x{addr:02x} failed: {e}")
+
 def set_servo(channel, angle, apply_offset=True):
     """Set servo angle with optional calibration"""
+    global _pca_check_counter
+    _pca_check_counter += 1
+    if _pca_check_counter >= _PCA_CHECK_INTERVAL:
+        _pca_check_counter = 0
+        _check_pca_health()
+
     servo_angles[channel] = angle
 
     if apply_offset and calibration:
@@ -865,6 +920,12 @@ def reset_all():
     print("✓ Reset to 90°")
 
 def cleanup():
+    # Stop background IMU reader first to free I2C bus
+    if gait_controller and gait_controller.balance:
+        try:
+            gait_controller.balance.stop_background_reader()
+        except:
+            pass
     if HW:
         print("Shutting down...")
         try:
@@ -918,13 +979,42 @@ def init_stability_monitor():
         print(f"✗ Stability monitor init failed: {e}")
         return False
 
+def init_data_logger():
+    """Initialize data logger for recording servo angles and IMU data"""
+    global data_logger
+    if not DATA_LOGGER_AVAILABLE:
+        return False
+
+    try:
+        data_logger = DataLogger()
+
+        def get_angles():
+            return servo_angles.copy()
+
+        def get_imu():
+            if gait_controller and gait_controller.balance:
+                return gait_controller.balance.get_cached_angles()
+            return 0.0, 0.0
+
+        data_logger.configure(get_angles, get_imu)
+        print("✓ Data logger initialized")
+        return True
+    except Exception as e:
+        print(f"✗ Data logger init failed: {e}")
+        return False
+
 # Initialize
 load_calibration()
 init_servos()
 init_kinematics()
 init_gait()
 init_stability_monitor()
+init_data_logger()
 load_custom_poses()
+
+# Start background IMU reader to prevent uncontrolled I2C polling from UI
+if gait_controller and gait_controller.balance and gait_controller.balance.is_available():
+    gait_controller.balance.start_background_reader(rate_hz=10)
 
 # Startup: go directly to stand position
 if HW:
@@ -1059,6 +1149,8 @@ async def set_pose_endpoint(pose_name: str, data: dict = {}):
         return {"status": "error", "message": f"Unknown pose: {pose_name}", "available": list(POSES.keys())}
     duration_ms = data.get("duration_ms", 500)
     success = set_pose(pose_name, duration_ms)
+    if success:
+        _emit_event(f"pose_{pose_name}")
     return {"status": "ok" if success else "error", "pose": pose_name, "body_state": body_state, "duration_ms": duration_ms}
 
 @app.post("/api/body")
@@ -1114,6 +1206,8 @@ async def start_gait(data: dict = {}):
         gait_controller.set_params(**data["params"])
 
     success = gait_controller.start(direction)
+    if success:
+        _emit_event(f"gait_start_{direction}")
     return {
         "status": "ok" if success else "error",
         "running": gait_controller.is_running(),
@@ -1127,6 +1221,8 @@ async def stop_gait():
         return {"status": "error", "message": "Gait not available"}
 
     success = gait_controller.stop()
+    if success:
+        _emit_event("gait_stop")
     return {
         "status": "ok" if success else "error",
         "running": gait_controller.is_running()
@@ -1507,7 +1603,8 @@ async def enable_balance(data: dict = {}):
     if not gait_controller:
         return {"error": "No gait"}
     enable = data.get("enable", True)
-    success = gait_controller.enable_balance(enable, True)
+    success = await asyncio.to_thread(gait_controller.enable_balance, enable, True)
+    _emit_event(f"balance_{'on' if enable else 'off'}")
     return {"ok": success, "enabled": gait_controller.use_balance}
 
 @app.post("/api/balance/calibrate")
@@ -1515,24 +1612,27 @@ async def calibrate_balance():
     """Calibrate IMU zero point"""
     if not gait_controller or not gait_controller.balance:
         return {"error": "No IMU"}
-    gait_controller.balance.calibrate(30)
+    await asyncio.to_thread(gait_controller.balance.calibrate, 30)
+    _emit_event("imu_calibrated")
     return {"ok": True}
 
 @app.get("/api/balance/angles")
 def get_balance_angles():
-    """Get current pitch/roll"""
+    """Get current pitch/roll - cached when gait is running to avoid I2C contention"""
     if not gait_controller or not gait_controller.balance:
         return {"pitch": 0, "roll": 0, "error": "no_balance_controller"}
     try:
-        # Check if IMU is actually available (not in simulation mode)
         bal = gait_controller.balance
         is_real = getattr(bal, 'is_available', lambda: False)()
-        p, r = bal.get_angles()
+        calibrating = getattr(bal, 'is_calibrating', False)
+        # Always use cached values - background thread keeps them fresh at 10Hz
+        p, r = bal.get_cached_angles()
         return {
             "pitch": round(p, 1),
             "roll": round(r, 1),
             "imu_available": is_real,
-            "simulation": getattr(bal, 'simulation_mode', True)
+            "simulation": getattr(bal, 'simulation_mode', True),
+            "calibrating": calibrating,
         }
     except Exception as e:
         return {"pitch": 0, "roll": 0, "error": str(e)}
@@ -1548,6 +1648,20 @@ def get_balance_config():
             "kp": getattr(gait_controller.balance, 'kp', 1.0)
         }
     return {"enabled": False, "error": "Balance controller not available"}
+
+@app.get("/api/events/recent")
+def get_recent_events(since: float = 0):
+    """Get recent events since a given timestamp (for real-time UI overlay)."""
+    if since > 0:
+        return [e for e in _recent_events if e["t"] > since]
+    return list(_recent_events)
+
+@app.get("/api/imu/health")
+def get_imu_health():
+    """Get IMU health status including stale data detection and recovery stats."""
+    if gait_controller and gait_controller.balance:
+        return gait_controller.balance.get_health()
+    return {"available": False}
 
 @app.post("/api/balance/config")
 async def set_balance_config(data: dict):
@@ -1582,10 +1696,10 @@ def get_stability_status():
     if not stability_monitor:
         return {"state": "unknown", "error": "Stability monitor not available"}
 
-    # Update stability monitor with current IMU readings if available
+    # Update stability monitor with cached IMU readings (background thread keeps them fresh)
     if gait_controller and gait_controller.balance:
         try:
-            pitch, roll = gait_controller.balance.get_angles()
+            pitch, roll = gait_controller.balance.get_cached_angles()
             stability_monitor.update(pitch, roll)
         except:
             pass
@@ -1738,6 +1852,64 @@ async def set_balance_kp_endpoint(data: dict):
     tuning_config["balance"]["kp"] = kp
     save_tuning_to_file()
     return {"ok": True, "kp": kp, "persisted": True}
+
+# ============== RECORDING ENDPOINTS ==============
+
+@app.get("/api/recording/status")
+def get_recording_status():
+    """Get current recording status"""
+    if not data_logger:
+        return {"available": False, "recording": False}
+    return {
+        "available": True,
+        "recording": data_logger.is_recording(),
+        "filename": data_logger.current_filename(),
+    }
+
+@app.post("/api/recording/start")
+async def start_recording(data: dict = {}):
+    """Start data recording"""
+    if not data_logger:
+        return {"error": "Data logger not available"}
+    sample_rate = data.get("sample_rate", 10.0)
+    success = data_logger.start(sample_rate)
+    return {"ok": success, "filename": data_logger.current_filename()}
+
+@app.post("/api/recording/stop")
+async def stop_recording():
+    """Stop data recording"""
+    if not data_logger:
+        return {"error": "Data logger not available"}
+    filename = data_logger.stop()
+    return {"ok": filename is not None, "filename": filename}
+
+@app.post("/api/recording/event")
+async def log_recording_event(data: dict):
+    """Add event tag to current recording"""
+    if not data_logger or not data_logger.is_recording():
+        return {"error": "Not recording"}
+    tag = data.get("tag", "")
+    if tag:
+        data_logger.log_event(tag)
+    return {"ok": True, "tag": tag}
+
+@app.get("/api/recordings")
+def list_recordings():
+    """List all recording files"""
+    if not data_logger:
+        return {"recordings": []}
+    return {"recordings": data_logger.list_recordings()}
+
+@app.get("/api/recordings/{filename}")
+def download_recording(filename: str):
+    """Download a recording CSV file"""
+    from fastapi.responses import FileResponse
+    if not data_logger:
+        return {"error": "Data logger not available"}
+    filepath = data_logger.get_filepath(filename)
+    if filepath:
+        return FileResponse(filepath, media_type="text/csv", filename=filename)
+    return {"error": "File not found"}
 
 # ============== MAIN ==============
 

@@ -143,6 +143,9 @@ class GaitController:
         self._current_angles = {}  # {channel: current_angle}
         self._interp_speed = 1.0   # 1.0 = direct to target (0.5 caused constant servo hunting and high current draw!)
 
+        # Cached balance corrections (read IMU once per gait cycle, not per leg)
+        self._balance_corrections = {}
+
         # Servo channel mapping
         # FL: hip=0, knee=1, ankle=2
         # FR: hip=3, knee=4, ankle=5
@@ -612,15 +615,20 @@ class GaitController:
         self._current_angles[ch] = new
         return new
 
+    def _update_balance_corrections(self):
+        """Read IMU once per gait cycle and cache corrections for all legs."""
+        if self.use_balance and self.balance:
+            try:
+                self._balance_corrections = self.balance.get_correction()
+            except:
+                pass
+        else:
+            self._balance_corrections = {}
+
     def _apply_leg_angles(self, leg_id: str, angles: dict):
         """Apply calculated angles to a leg's servos (with balance)"""
         leg = self.legs[leg_id]
-        bal = 0
-        if self.use_balance and self.balance:
-            try:
-                bal = self.balance.get_correction().get(leg_id, 0)
-            except:
-                pass
+        bal = self._balance_corrections.get(leg_id, 0)
         hip = int(self._interpolate(leg["hip"], angles["hip"]))
         knee = int(self._interpolate(leg["knee"], angles["knee"] + bal))
         ankle = int(self._interpolate(leg["ankle"], angles["ankle"] - bal * 0.5))
@@ -648,6 +656,9 @@ class GaitController:
             elapsed = time.time() - start_time
             cycle_phase = (elapsed % cycle_time) / cycle_time
             current_half = 0 if cycle_phase < 0.5 else 1
+
+            # Read IMU once per iteration (not per leg)
+            self._update_balance_corrections()
 
             if DEBUG and current_half != last_phase_half:
                 if current_half == 0:
@@ -688,6 +699,7 @@ class GaitController:
     def _return_to_stand(self):
         """Smoothly return all legs to STAND position"""
         print("Returning to stand position...")
+        self._update_balance_corrections()
         for leg_id in self.legs:
             self._apply_leg_angles(leg_id, self.stand_angles[leg_id])
 
@@ -696,6 +708,7 @@ class GaitController:
         print(f"\n{'=' * 60}")
         print("GOING TO STAND POSITION")
         print(f"{'=' * 60}")
+        self._update_balance_corrections()
         for leg_id, angles in self.stand_angles.items():
             print(f"  {leg_id}: hip={angles['hip']}, knee={angles['knee']}, ankle={angles['ankle']}")
             self._apply_leg_angles(leg_id, angles)
@@ -753,6 +766,9 @@ class GaitController:
         for i in range(steps):
             cycle_phase = i / steps
             current_half = 0 if cycle_phase < 0.5 else 1
+
+            # Read IMU once per iteration
+            self._update_balance_corrections()
 
             if current_half != last_half:
                 if current_half == 0:

@@ -44,13 +44,17 @@ dash = [
     "dash-bootstrap-components>=1.5.0",
     "plotly>=5.18.0",
 ]
+nicegui = [
+    "nicegui>=2.0.0",
+    "httpx>=0.25.0",
+]
 dev = [
     "pytest>=7.4.0",
     "black>=23.0.0",
     "flake8>=6.0.0",
     "isort>=5.12.0",
 ]
-all = ["microspot[hardware,dash,dev]"]
+all = ["microspot[hardware,dash,nicegui,dev]"]
 
 [project.urls]
 Homepage = "https://github.com/maerestijnde/spotmicro"

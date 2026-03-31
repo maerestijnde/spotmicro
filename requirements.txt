@@ -10,6 +10,8 @@ streamlit>=1.28.0
 dash>=2.14.0
 dash-bootstrap-components>=1.5.0
 plotly>=5.18.0
+nicegui>=2.0.0
+httpx>=0.25.0
 
 # Hardware (Raspberry Pi)
 adafruit-circuitpython-pca9685>=3.4.0
