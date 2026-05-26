@@ -44,6 +44,14 @@ except ImportError:
     GENERATOR_AVAILABLE = False
     print("Warning: GaitGenerator not available")
 
+# Try to import crawl gait
+try:
+    from crawl_gait import CrawlGaitController
+    CRAWL_AVAILABLE = True
+except ImportError:
+    CRAWL_AVAILABLE = False
+    print("Warning: CrawlGait not available")
+
 # =============================================================================
 # Gait Constants
 # =============================================================================
@@ -110,7 +118,7 @@ class GaitController:
     - IK-based (use_ik=True): Foot trajectories with inverse kinematics
     """
 
-    def __init__(self, set_servo_func: Callable[[int, float, bool], bool], use_ik: bool = False, generator_mode: bool = False):
+    def __init__(self, set_servo_func: Callable[[int, float, bool], bool], use_ik: bool = False, generator_mode: bool = False, crawl_mode: bool = False):
         """
         Initialize gait controller
 
@@ -119,12 +127,28 @@ class GaitController:
             use_ik: If True, use IK-based foot trajectories. Falls back to angle-based if IK unavailable.
             generator_mode: If True, use CPG-based GaitGenerator for phase/trajectory engine.
                             Requires IK. Falls back to angle-based if unavailable.
+            crawl_mode: If True, use 8-phase crawl gait with body shifting.
+                        Falls back to angle-based if unavailable.
         """
         self.set_servo = set_servo_func
         self.params = DEFAULT_GAIT_PARAMS.copy()
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.direction = "forward"  # forward, backward, left, right
+
+        # Crawl mode delegation
+        self.crawl_mode = crawl_mode and CRAWL_AVAILABLE
+        self.crawl_controller: Optional[CrawlGaitController] = None
+        if crawl_mode:
+            if CRAWL_AVAILABLE:
+                try:
+                    self.crawl_controller = CrawlGaitController(set_servo_func, use_ik=use_ik)
+                    print("Crawl mode enabled")
+                except Exception as e:
+                    print(f"Crawl init failed: {e}, using trot gait")
+                    self.crawl_mode = False
+            else:
+                print("Warning: CrawlGait not available, using trot gait")
 
         # Generator mode setting (CPG-based gait generator)
         self.generator_mode = generator_mode and GENERATOR_AVAILABLE and IK_AVAILABLE
@@ -253,17 +277,40 @@ class GaitController:
             print(f"Failed to set gait type: {e}")
             return False
 
-    def set_mode(self, use_ik: bool, generator_mode: bool = False) -> bool:
+    def set_mode(self, use_ik: bool, generator_mode: bool = False, crawl_mode: bool = False) -> bool:
         """
         Switch between IK, generator, and angle-based gait modes.
 
         Args:
             use_ik: True for IK mode, False for angle-based
             generator_mode: True for CPG-based gait generator (requires IK)
+            crawl_mode: True for 8-phase crawl gait with body shifting
 
         Returns:
             True if mode was set successfully
         """
+        # Handle crawl mode
+        if crawl_mode:
+            if not CRAWL_AVAILABLE:
+                print("CrawlGait not available")
+                return False
+            try:
+                if self.crawl_controller is None:
+                    self.crawl_controller = CrawlGaitController(self.set_servo, use_ik=use_ik)
+                self.crawl_mode = True
+                self.generator_mode = False
+                self.use_ik = False
+                print("Switched to crawl mode")
+                return True
+            except Exception as e:
+                print(f"Failed to switch to crawl mode: {e}")
+                return False
+
+        # If disabling crawl mode, fall through to other modes
+        if self.crawl_mode and not crawl_mode:
+            self.crawl_mode = False
+            print("Crawl mode disabled")
+
         if generator_mode and not GENERATOR_AVAILABLE:
             print("GaitGenerator not available, staying in current mode")
             return False
@@ -322,8 +369,21 @@ class GaitController:
 
         return True
 
+    def set_crawl_params(self, **kwargs) -> bool:
+        """Update crawl gait parameters (delegates to crawl controller)."""
+        if self.crawl_controller:
+            self.crawl_controller.set_params(**kwargs)
+            return True
+        return False
+
     def set_params(self, **kwargs):
         """Update gait parameters"""
+        # Delegate crawl-specific params if in crawl mode
+        if self.crawl_mode and self.crawl_controller:
+            crawl_params = {k: v for k, v in kwargs.items()
+                            if k in ("cycle_time", "speed", "step_height", "step_length", "knee_bend")}
+            if crawl_params:
+                self.crawl_controller.set_params(**crawl_params)
         for key, value in kwargs.items():
             if key in self.params:
                 self.params[key] = value
@@ -396,6 +456,8 @@ class GaitController:
             The calibration system handles left/right mirroring via direction.
             Ankle compensates ~1.0x knee bend for foot under knee.
         """
+        if self.crawl_mode and self.crawl_controller:
+            return self.crawl_controller.set_stand_height(knee_bend)
         # Clamp to safe range (0=straight, 80=very low like rest pose)
         knee_bend = max(0, min(80, knee_bend))
 
@@ -436,6 +498,8 @@ class GaitController:
 
     def enable_balance(self, enable=True, calibrate=True):
         """Enable/disable IMU balance correction"""
+        if self.crawl_mode and self.crawl_controller:
+            return self.crawl_controller.enable_balance(enable, calibrate)
         if not BALANCE_AVAILABLE or not self.balance:
             print("Balance not available")
             return False
@@ -458,6 +522,8 @@ class GaitController:
         result = self.params.copy()
         result["use_ik"] = self.use_ik
         result["ik_available"] = IK_AVAILABLE
+        result["crawl_mode"] = self.crawl_mode
+        result["generator_mode"] = self.generator_mode
         return result
 
     def _smooth_phase(self, t: float) -> float:
@@ -849,6 +915,8 @@ class GaitController:
 
     def goto_stand(self):
         """Move robot to STAND position (ready to walk)"""
+        if self.crawl_mode and self.crawl_controller:
+            return self.crawl_controller.goto_stand()
         print(f"\n{'=' * 60}")
         print("GOING TO STAND POSITION")
         print(f"{'=' * 60}")
@@ -864,6 +932,9 @@ class GaitController:
             print("Gait already running")
             return False
 
+        if self.crawl_mode and self.crawl_controller:
+            return self.crawl_controller.start(direction)
+
         self.goto_stand()
         time.sleep(0.3)
 
@@ -878,6 +949,8 @@ class GaitController:
 
     def stop(self):
         """Stop the gait"""
+        if self.crawl_mode and self.crawl_controller:
+            return self.crawl_controller.stop()
         if not self.running:
             print("Gait not running")
             return False
@@ -890,10 +963,14 @@ class GaitController:
 
     def is_running(self) -> bool:
         """Check if gait is running"""
+        if self.crawl_mode and self.crawl_controller:
+            return self.crawl_controller.is_running()
         return self.running
 
     def single_step(self, direction: str = "forward"):
         """Execute a single step cycle (for testing) - starts from STAND position"""
+        if self.crawl_mode and self.crawl_controller:
+            return self.crawl_controller.single_step(direction)
         print(f"\n{'=' * 60}")
         print(f"SINGLE STEP - Direction: {direction}")
         if self.generator_mode:

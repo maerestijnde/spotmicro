@@ -111,6 +111,15 @@ except Exception as e:
     KINEMATICS_AVAILABLE = False
     log_init.warning(f"Kinematics not available: {e}")
 
+# Import IK Interface
+try:
+    from ik_interface import IKInterface
+    IK_INTERFACE_AVAILABLE = True
+    log_init.info("IK Interface loaded")
+except Exception as e:
+    IK_INTERFACE_AVAILABLE = False
+    log_init.warning(f"IK Interface not available: {e}")
+
 # Hardware initialization
 HW = False
 pca_front = None
@@ -809,46 +818,60 @@ def set_body_pose(x=None, y=None, z=None, phi=None, theta=None, psi=None):
         print(f"✗ Body pose error: {e}")
         return False
 
+# Global IK interface
+ik_interface = None
+
+def init_ik_interface():
+    """Initialize IK interface for per-leg foot positioning"""
+    global ik_interface
+    if not IK_INTERFACE_AVAILABLE:
+        return False
+
+    try:
+        ik_interface = IKInterface(
+            calibration_path=str(BASE_DIR / "calibration.json"),
+            body_height=body_state.get("y", 0.14)
+        )
+        print("✓ IK interface initialized")
+        return True
+    except Exception as e:
+        print(f"✗ IK interface init failed: {e}")
+        return False
+
 def set_foot_position(leg_id, x, y, z):
     """
-    Set individual foot position relative to body origin.
-
-    This is a placeholder for future IK-based foot positioning. When implemented,
-    this function will allow precise control of each foot's position in 3D space,
-    which is essential for:
-    - Terrain adaptation (stepping over obstacles)
-    - Body shifting during gait (moving CoG over support legs)
-    - Custom foot trajectories for different gaits
+    Set individual foot position relative to body origin using IK.
 
     Args:
         leg_id: Leg identifier ("FL", "FR", "RL", "RR")
         x: Forward/backward position in meters (+X = forward)
         y: Height position in meters (+Y = up)
-        z: Left/right position in meters (+Z = left)
+        z: Left/right position in meters (+Z = right)
 
     Returns:
         bool: True if position was set successfully, False otherwise
-
-    Note:
-        The current kinematics library (SpotMicroStickFigure) operates on all
-        four legs simultaneously. Per-leg IK would require either:
-        1. Implementing 3-DOF inverse kinematics for a single leg
-        2. Using the existing library but only applying results for one leg
-
-    See Also:
-        - ik_interface.py for the IK wrapper module
-        - CLAUDE.md for architecture documentation
     """
-    # TODO: Implement per-leg IK using one of these approaches:
-    # 1. Extract single-leg IK math from kinematics library
-    # 2. Create IKInterface.set_single_foot() method
-    # 3. Use geometric IK: given (x, y, z), solve for hip, knee, ankle angles
-    #
-    # For geometric IK approach:
-    #   - Calculate distance from hip to foot
-    #   - Use law of cosines to find knee angle
-    #   - Use atan2 for hip and ankle angles
-    pass
+    if leg_id not in QUAD_CONFIG:
+        log_api.error(f"Invalid leg_id: {leg_id}")
+        return False
+
+    # Safety limits: clamp to reasonable workspace bounds
+    MAX_REACH = 0.30  # meters - approximate max leg reach
+    x = max(-MAX_REACH, min(MAX_REACH, x))
+    y = max(-0.05, min(0.25, y))
+    z = max(-MAX_REACH, min(MAX_REACH, z))
+
+    try:
+        if ik_interface is None:
+            log_api.error("IK interface not available")
+            return False
+
+        angles = ik_interface.set_foot_position(leg_id, x, y, z)
+        set_leg(leg_id, angles)
+        return True
+    except Exception as e:
+        log_api.error(f"set_foot_position error: {e}")
+        return False
 
 def set_pose(pose_name, duration_ms=0):
     """
@@ -1011,6 +1034,7 @@ def init_data_logger():
 load_calibration()
 init_servos()
 init_kinematics()
+init_ik_interface()
 init_gait()
 init_stability_monitor()
 init_data_logger()
@@ -1140,6 +1164,29 @@ async def set_leg_endpoint(leg_id: str, data: dict):
         return {"status": "error", "message": f"Unknown leg: {leg_id}"}
     success = set_leg(leg_id, angles)
     return {"status": "ok" if success else "error", "leg_id": leg_id, "angles": angles}
+
+@app.post("/api/foot/{leg_id}")
+async def set_foot_position_endpoint(leg_id: str, data: dict):
+    """Set foot position for a specific leg using IK.
+
+    Args:
+        data: {"x": float, "y": float, "z": float} in meters
+              x: forward (+) / backward (-)
+              y: up (+) / down (-)
+              z: right (+) / left (-)
+    """
+    if leg_id not in QUAD_CONFIG:
+        return {"status": "error", "message": f"Unknown leg: {leg_id}"}
+
+    x = data.get("x", 0.0)
+    y = data.get("y", 0.0)
+    z = data.get("z", 0.0)
+    success = set_foot_position(leg_id, x, y, z)
+    return {
+        "status": "ok" if success else "error",
+        "leg_id": leg_id,
+        "x": x, "y": y, "z": z
+    }
 
 @app.post("/api/pose/{pose_name}")
 async def set_pose_endpoint(pose_name: str, data: dict = {}):
@@ -1310,41 +1357,88 @@ async def set_lateral_rate(data: dict):
 
 @app.post("/api/gait/mode")
 async def set_gait_mode(data: dict = {}):
-    """Switch between IK and angle-based gait modes.
+    """Switch between gait modes: angle, ik, generator, crawl.
 
     Args:
-        data: {"use_ik": bool} - True for IK mode, False for angle-based
+        data: {
+            "mode": str,       # "angle" | "ik" | "generator" | "crawl"
+            "use_ik": bool,    # legacy alias for "ik" mode
+            "gait_type": str   # for generator mode: "walk" | "trot" | "pace" | "bound"
+        }
 
     Returns:
-        {"success": bool, "mode": str, "ik_available": bool}
+        {"success": bool, "mode": str, "ik_available": bool, "crawl_available": bool}
     """
     if not GAIT_AVAILABLE or not gait_controller:
         return {"success": False, "error": "Gait controller not initialized"}
 
+    mode = data.get("mode", None)
     use_ik = data.get("use_ik", False)
+    gait_type = data.get("gait_type", None)
 
-    # Try to set the mode
-    success = gait_controller.set_mode(use_ik)
+    # Map legacy use_ik to mode string
+    if mode is None:
+        mode = "ik" if use_ik else "angle"
+
+    success = False
+    if mode == "crawl":
+        success = gait_controller.set_mode(use_ik=False, crawl_mode=True)
+    elif mode == "generator":
+        success = gait_controller.set_mode(use_ik=True, generator_mode=True)
+        if success and gait_type:
+            gait_controller.set_gait_type(gait_type)
+    elif mode == "ik":
+        success = gait_controller.set_mode(use_ik=True)
+    else:
+        success = gait_controller.set_mode(use_ik=False)
+
+    params = gait_controller.get_params()
+    current_mode = "crawl" if params.get("crawl_mode") else (
+        "generator" if params.get("generator_mode") else (
+            "ik" if params.get("use_ik") else "angle"
+        )
+    )
 
     return {
         "success": success,
-        "mode": "ik" if gait_controller.use_ik else "angle",
-        "ik_available": hasattr(gait_controller, 'ik_interface') and gait_controller.ik_interface is not None
+        "mode": current_mode,
+        "ik_available": params.get("ik_available", False),
+        "crawl_available": hasattr(gait_controller, 'crawl_controller') and gait_controller.crawl_controller is not None
     }
 
 @app.get("/api/gait/mode")
 def get_gait_mode():
-    """Get current gait mode (IK or angle-based)."""
+    """Get current gait mode and available modes."""
     if not GAIT_AVAILABLE or not gait_controller:
         return {"error": "Gait controller not initialized"}
 
     params = gait_controller.get_params()
+    current_mode = "crawl" if params.get("crawl_mode") else (
+        "generator" if params.get("generator_mode") else (
+            "ik" if params.get("use_ik") else "angle"
+        )
+    )
     return {
-        "mode": "ik" if params.get("use_ik", False) else "angle",
+        "mode": current_mode,
         "ik_available": params.get("ik_available", False),
+        "crawl_available": hasattr(gait_controller, 'crawl_controller') and gait_controller.crawl_controller is not None,
+        "generator_available": params.get("generator_mode", False) or hasattr(gait_controller, 'gait_generator') and gait_controller.gait_generator is not None,
         "ik_step_height": params.get("ik_step_height", 0.03),
         "ik_stride_length": params.get("ik_stride_length", 0.04)
     }
+
+@app.post("/api/gait/crawl_params")
+async def set_crawl_params(data: dict):
+    """Update crawl gait specific parameters.
+
+    Args:
+        data: {"cycle_time": float, "speed": float, "step_height": float,
+               "step_length": float, "knee_bend": int}
+    """
+    if not GAIT_AVAILABLE or not gait_controller:
+        return {"status": "error", "message": "Gait not available"}
+    ok = gait_controller.set_crawl_params(**data)
+    return {"status": "ok" if ok else "error", "params": data}
 
 # ============== CUSTOM POSES API ENDPOINTS ==============
 
