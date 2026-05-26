@@ -971,8 +971,12 @@ def init_stability_monitor():
         return False
 
     try:
-        # Use default thresholds
-        stability_monitor = StabilityMonitor()
+        # Wire emergency callback to stop gait when robot is critically tilted
+        emergency_cb = None
+        if GAIT_AVAILABLE and gait_controller:
+            emergency_cb = gait_controller.stop
+
+        stability_monitor = StabilityMonitor(emergency_callback=emergency_cb)
         print("✓ Stability monitor initialized")
         return True
     except Exception as e:

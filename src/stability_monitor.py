@@ -4,11 +4,11 @@ Stability monitoring for quadruped robot.
 
 This module provides real-time stability monitoring based on IMU pitch/roll readings.
 It categorizes the robot's stability state and can trigger appropriate responses
-when instability is detected.
+when instability is detected, including an emergency callback to halt locomotion.
 """
 from enum import Enum
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Callable
 import time
 
 
@@ -54,23 +54,34 @@ class StabilityMonitor:
     - CRITICAL: Significantly tilted, corrective action recommended
     - EMERGENCY: Severely tilted, immediate action required (e.g., stop walking)
 
+    An optional emergency_callback can be provided; it is invoked once
+    whenever the state transitions into EMERGENCY. A cooldown period
+    prevents rapid flapping between EMERGENCY and less severe states.
+
     Example usage:
-        monitor = StabilityMonitor()
+        monitor = StabilityMonitor(emergency_callback=gait_controller.stop)
 
         # In your control loop:
         state = monitor.update(pitch, roll)
         if state == StabilityState.EMERGENCY:
-            gait_controller.stop()
+            print("Emergency! Gait should be stopped.")
 
         # Get detailed status:
         status = monitor.get_status()
     """
 
-    def __init__(self, thresholds: Optional[StabilityThresholds] = None):
+    def __init__(
+        self,
+        thresholds: Optional[StabilityThresholds] = None,
+        emergency_callback: Optional[Callable[[], None]] = None,
+        emergency_cooldown: float = 2.0
+    ):
         """Initialize the stability monitor.
 
         Args:
             thresholds: Custom thresholds for stability states. If None, uses defaults.
+            emergency_callback: Optional callable invoked when entering EMERGENCY state.
+            emergency_cooldown: Seconds to remain in EMERGENCY before allowing downgrade.
         """
         self.thresholds = thresholds or StabilityThresholds()
         self.current_state = StabilityState.STABLE
@@ -86,6 +97,11 @@ class StabilityMonitor:
 
         # Callbacks for state changes
         self._on_state_change_callbacks: list = []
+
+        # Emergency handling
+        self._emergency_callback = emergency_callback
+        self._emergency_cooldown = emergency_cooldown
+        self._emergency_until = 0.0  # Timestamp when EMERGENCY cooldown ends
 
     def update(self, pitch: float, roll: float) -> StabilityState:
         """Update with current IMU readings and return stability state.
@@ -114,6 +130,10 @@ class StabilityMonitor:
         else:
             new_state = StabilityState.STABLE
 
+        # Emergency cooldown: prevent flapping by enforcing minimum time in EMERGENCY
+        if self.current_state == StabilityState.EMERGENCY and time.time() < self._emergency_until:
+            new_state = StabilityState.EMERGENCY
+
         # Handle state transition
         if new_state != self.current_state:
             self._handle_state_change(new_state)
@@ -140,7 +160,15 @@ class StabilityMonitor:
         self.current_state = new_state
         self.state_start_time = time.time()
 
-        # Notify callbacks
+        # Invoke emergency callback when entering EMERGENCY
+        if new_state == StabilityState.EMERGENCY and self._emergency_callback is not None:
+            self._emergency_until = time.time() + self._emergency_cooldown
+            try:
+                self._emergency_callback()
+            except Exception as e:
+                print(f"Emergency callback error: {e}")
+
+        # Notify generic callbacks
         for callback in self._on_state_change_callbacks:
             try:
                 callback(self.previous_state, new_state, self.pitch, self.roll)
@@ -226,3 +254,4 @@ class StabilityMonitor:
         self.roll = 0.0
         self.state_start_time = time.time()
         self.state_history.clear()
+        self._emergency_until = 0.0

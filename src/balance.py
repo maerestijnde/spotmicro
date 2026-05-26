@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Balance Controller for MicroSpot
-Uses MPU6050 IMU for pitch/roll measurement and balance correction
+Uses MPU6050 IMU for pitch/roll measurement and balance correction.
+Implements complementary filter (accel + gyro fusion) and PID-style control.
 """
 import math
 import time
@@ -20,8 +21,9 @@ class BalanceController:
     """
     IMU-based balance controller for quadruped robot.
 
-    Uses MPU6050 accelerometer to measure pitch and roll,
-    then calculates leg angle corrections to maintain balance.
+    Uses MPU6050 accelerometer and gyroscope with a complementary filter
+    to measure pitch and roll, then calculates leg angle corrections
+    via PID-style control to maintain balance.
     """
 
     def __init__(self, address=0x68, bus=None):
@@ -61,7 +63,12 @@ class BalanceController:
         self.roll_offset = 0.0
 
         # Control gains
-        self.kp = 0.5  # Proportional gain for balance correction
+        self.balance_gain = 0.5  # Proportional gain for balance correction
+        self.ki = 0.0            # Integral gain (disabled by default)
+        self.kd = 0.0            # Derivative gain (disabled by default)
+        self._integral_limit = 10.0  # Anti-windup clamp (degrees·s)
+
+        # Pitch/roll sensitivity
         self.pitch_gain = 1.0  # Pitch sensitivity
         self.roll_gain = 1.0   # Roll sensitivity
 
@@ -83,9 +90,38 @@ class BalanceController:
         # Filtering
         self._last_pitch = 0.0
         self._last_roll = 0.0
-        self._last_raw_pitch = 0.0  # Last valid raw reading (before filter)
+        self._last_raw_pitch = 0.0  # Last valid raw accel reading
         self._last_raw_roll = 0.0
         self._alpha = 0.25  # Low-pass filter coefficient (0-1, higher = more responsive)
+
+        # Complementary filter state
+        self._fused_pitch = 0.0
+        self._fused_roll = 0.0
+        self._last_fused_time = time.time()
+        self._complementary_alpha = 0.98  # Gyro trust factor
+
+        # Gyro fallback state
+        self._last_gyro_x = 0.0
+        self._last_gyro_y = 0.0
+
+        # PID state
+        self._pitch_integral = 0.0
+        self._roll_integral = 0.0
+        self._last_pitch_error = 0.0
+        self._last_roll_error = 0.0
+        self._last_correction_time = time.time()
+
+    # ------------------------------------------------------------------
+    # Backward-compatible alias: kp -> balance_gain
+    # ------------------------------------------------------------------
+    @property
+    def kp(self) -> float:
+        """Backward-compatible alias for balance_gain."""
+        return self.balance_gain
+
+    @kp.setter
+    def kp(self, value: float):
+        self.balance_gain = value
 
     @property
     def is_calibrating(self):
@@ -128,8 +164,16 @@ class BalanceController:
 
             # Refresh cached values with new offsets so UI doesn't show stale data
             raw_p, raw_r = self._read_raw_angles()
+            self._fused_pitch = raw_p
+            self._fused_roll = raw_r
             self._last_pitch = (raw_p - self.pitch_offset) * self.pitch_gain
             self._last_roll = (raw_r - self.roll_offset) * self.roll_gain
+
+            # Reset PID state after calibration
+            self._pitch_integral = 0.0
+            self._roll_integral = 0.0
+            self._last_pitch_error = 0.0
+            self._last_roll_error = 0.0
         finally:
             self._calibrating = False
 
@@ -169,9 +213,58 @@ class BalanceController:
                 print(f"IMU read error: {e}")
                 return self._last_raw_pitch, self._last_raw_roll
 
+    def _read_gyro_rates(self):
+        """
+        Read gyroscope rates from MPU6050.
+
+        Returns:
+            Tuple of (gx, gy) in degrees/second
+        """
+        if self.simulation_mode or self.imu is None:
+            return 0.0, 0.0
+
+        with self._lock:
+            try:
+                # Try library method first
+                gyro = self.imu.get_gyro_data()
+                gx, gy = gyro['x'], gyro['y']
+            except Exception:
+                # Fallback: read raw registers 0x43-0x48
+                try:
+                    import smbus2
+                    bus_num = self._i2c_bus or 1
+                    with smbus2.SMBus(bus_num) as bus:
+                        data = bus.read_i2c_block_data(self._i2c_address, 0x43, 6)
+
+                    def _combine(high, low):
+                        val = (high << 8) | low
+                        if val > 32767:
+                            val -= 65536
+                        return val
+
+                    raw_x = _combine(data[0], data[1])
+                    raw_y = _combine(data[2], data[3])
+                    raw_z = _combine(data[4], data[5])
+
+                    # Default scale: ±250°/s = 131 LSB/(°/s)
+                    gx = raw_x / 131.0
+                    gy = raw_y / 131.0
+                    # gz = raw_z / 131.0  # not used for pitch/roll
+                except Exception:
+                    return self._last_gyro_x, self._last_gyro_y
+
+            # Guard against all-zeros bad reading
+            if abs(gx) < 0.01 and abs(gy) < 0.01:
+                return self._last_gyro_x, self._last_gyro_y
+
+            self._last_gyro_x = gx
+            self._last_gyro_y = gy
+            return gx, gy
+
     def get_angles(self):
         """
         Get current pitch and roll angles (calibrated and filtered).
+        Uses complementary filter to fuse accelerometer and gyroscope.
 
         Returns:
             Tuple of (pitch, roll) in degrees
@@ -180,13 +273,33 @@ class BalanceController:
         if self._calibrating:
             return self._last_pitch, self._last_roll
 
-        raw_pitch, raw_roll = self._read_raw_angles()
+        # Read sensors
+        accel_pitch, accel_roll = self._read_raw_angles()
+        gyro_x, gyro_y = self._read_gyro_rates()
 
-        # Apply calibration offset
-        pitch = (raw_pitch - self.pitch_offset) * self.pitch_gain
-        roll = (raw_roll - self.roll_offset) * self.roll_gain
+        # Compute dt for complementary filter
+        now = time.time()
+        dt = now - self._last_fused_time
+        self._last_fused_time = now
+        # Clamp dt to prevent huge jumps after pause
+        dt = max(0.001, min(0.1, dt))
 
-        # Low-pass filter for smoothing
+        # Complementary filter:
+        #   angle = alpha * (angle + gyro_rate * dt) + (1 - alpha) * accel_angle
+        self._fused_pitch = (
+            self._complementary_alpha * (self._fused_pitch + gyro_y * dt)
+            + (1.0 - self._complementary_alpha) * accel_pitch
+        )
+        self._fused_roll = (
+            self._complementary_alpha * (self._fused_roll + gyro_x * dt)
+            + (1.0 - self._complementary_alpha) * accel_roll
+        )
+
+        # Apply calibration offset and per-axis sensitivity
+        pitch = (self._fused_pitch - self.pitch_offset) * self.pitch_gain
+        roll = (self._fused_roll - self.roll_offset) * self.roll_gain
+
+        # Light low-pass filter for additional smoothing
         pitch = self._alpha * pitch + (1 - self._alpha) * self._last_pitch
         roll = self._alpha * roll + (1 - self._alpha) * self._last_roll
 
@@ -340,11 +453,15 @@ class BalanceController:
             "stale_count": self._stale_count,
             "recovery_count": self._recovery_count,
             "bg_running": self._bg_running,
+            "filter": "complementary",
+            "balance_gain": round(self.balance_gain, 3),
+            "ki": round(self.ki, 4),
+            "kd": round(self.kd, 4),
         }
 
     def get_correction(self):
         """
-        Calculate balance correction for each leg.
+        Calculate balance correction for each leg using PID-style control.
 
         Returns:
             Dict mapping leg_id to correction angle in degrees
@@ -352,32 +469,97 @@ class BalanceController:
         """
         pitch, roll = self.get_angles()
 
-        # Calculate corrections based on body orientation
-        # If body tilts forward (positive pitch), front legs should extend, rear legs bend
-        # If body tilts right (positive roll), left legs should extend, right legs bend
+        now = time.time()
+        dt = now - self._last_correction_time
+        self._last_correction_time = now
+        dt = max(0.001, min(0.1, dt))
+
+        # Errors relative to level (0°)
+        pitch_error = pitch
+        roll_error = roll
+
+        # Proportional term
+        pitch_p = pitch_error * self.balance_gain
+        roll_p = roll_error * self.balance_gain
+
+        # Integral term with anti-windup
+        self._pitch_integral += pitch_error * dt
+        self._roll_integral += roll_error * dt
+        self._pitch_integral = max(-self._integral_limit, min(self._integral_limit, self._pitch_integral))
+        self._roll_integral = max(-self._integral_limit, min(self._integral_limit, self._roll_integral))
+
+        pitch_i = self._pitch_integral * self.ki
+        roll_i = self._roll_integral * self.ki
+
+        # Derivative term
+        pitch_d = (pitch_error - self._last_pitch_error) / dt * self.kd
+        roll_d = (roll_error - self._last_roll_error) / dt * self.kd
+
+        self._last_pitch_error = pitch_error
+        self._last_roll_error = roll_error
+
+        pitch_total = pitch_p + pitch_i + pitch_d
+        roll_total = roll_p + roll_i + roll_d
 
         corrections = {}
 
         # Front legs
-        corrections['FL'] = -pitch * self.kp - roll * self.kp * 0.5
-        corrections['FR'] = -pitch * self.kp + roll * self.kp * 0.5
+        corrections['FL'] = -pitch_total - roll_total * 0.5
+        corrections['FR'] = -pitch_total + roll_total * 0.5
 
         # Rear legs - NEGATIVE pitch correction (lift rear when tilting forward)
         # 0.5 factor makes rear legs less aggressive than front
-        corrections['RL'] = -pitch * self.kp * 0.5 - roll * self.kp * 0.5
-        corrections['RR'] = -pitch * self.kp * 0.5 + roll * self.kp * 0.5
+        corrections['RL'] = -pitch_total * 0.5 - roll_total * 0.5
+        corrections['RR'] = -pitch_total * 0.5 + roll_total * 0.5
 
         return corrections
 
-    def set_kp(self, kp):
+    def set_balance_gain(self, gain: float):
         """
         Set proportional gain for balance correction.
 
         Args:
+            gain: Proportional gain (0.0 to 2.0 typical)
+        """
+        self.balance_gain = max(0.0, min(2.0, gain))
+        print(f"Balance gain set to {self.balance_gain}")
+
+    def set_kp(self, kp):
+        """
+        Backward-compatible alias for set_balance_gain().
+
+        Args:
             kp: Proportional gain (0.0 to 2.0 typical)
         """
-        self.kp = max(0.0, min(2.0, kp))
-        print(f"Balance Kp set to {self.kp}")
+        self.set_balance_gain(kp)
+
+    def set_ki(self, ki: float):
+        """
+        Set integral gain for balance correction.
+
+        Args:
+            ki: Integral gain (0.0 to 1.0 typical)
+        """
+        self.ki = max(0.0, min(1.0, ki))
+        print(f"Balance Ki set to {self.ki}")
+
+    def set_kd(self, kd: float):
+        """
+        Set derivative gain for balance correction.
+
+        Args:
+            kd: Derivative gain (0.0 to 1.0 typical)
+        """
+        self.kd = max(0.0, min(1.0, kd))
+        print(f"Balance Kd set to {self.kd}")
+
+    def reset_pid(self):
+        """Reset PID integral and derivative state."""
+        self._pitch_integral = 0.0
+        self._roll_integral = 0.0
+        self._last_pitch_error = 0.0
+        self._last_roll_error = 0.0
+        print("Balance PID state reset")
 
     def is_available(self):
         """Check if IMU is available and working."""
