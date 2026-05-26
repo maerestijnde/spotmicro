@@ -104,6 +104,7 @@ CLAUDE.md
 # Project specific
 *.log
 logs/
+calibration.json
 calibration_backup*.json
 tuning_backup*.json
 
