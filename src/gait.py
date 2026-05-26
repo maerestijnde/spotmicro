@@ -36,6 +36,14 @@ except ImportError:
     IK_AVAILABLE = False
     print("Warning: IK interface not available, using angle-based gait")
 
+# Try to import CPG gait generator
+try:
+    from gait_generator import GaitGenerator, CPGConfig, BezierConfig
+    GENERATOR_AVAILABLE = True
+except ImportError:
+    GENERATOR_AVAILABLE = False
+    print("Warning: GaitGenerator not available")
+
 # =============================================================================
 # Gait Constants
 # =============================================================================
@@ -102,13 +110,15 @@ class GaitController:
     - IK-based (use_ik=True): Foot trajectories with inverse kinematics
     """
 
-    def __init__(self, set_servo_func: Callable[[int, float, bool], bool], use_ik: bool = False):
+    def __init__(self, set_servo_func: Callable[[int, float, bool], bool], use_ik: bool = False, generator_mode: bool = False):
         """
         Initialize gait controller
 
         Args:
             set_servo_func: Function to set servo angle - set_servo(channel, angle, apply_offset=True)
             use_ik: If True, use IK-based foot trajectories. Falls back to angle-based if IK unavailable.
+            generator_mode: If True, use CPG-based GaitGenerator for phase/trajectory engine.
+                            Requires IK. Falls back to angle-based if unavailable.
         """
         self.set_servo = set_servo_func
         self.params = DEFAULT_GAIT_PARAMS.copy()
@@ -116,8 +126,16 @@ class GaitController:
         self.thread: Optional[threading.Thread] = None
         self.direction = "forward"  # forward, backward, left, right
 
+        # Generator mode setting (CPG-based gait generator)
+        self.generator_mode = generator_mode and GENERATOR_AVAILABLE and IK_AVAILABLE
+        self.gait_generator = None
+        if generator_mode and not GENERATOR_AVAILABLE:
+            print("Warning: GaitGenerator requested but not available")
+        if generator_mode and not IK_AVAILABLE:
+            print("Warning: GaitGenerator requires IK, falling back to angle-based")
+
         # IK mode setting
-        self.use_ik = use_ik and IK_AVAILABLE
+        self.use_ik = (use_ik or self.generator_mode) and IK_AVAILABLE
         if use_ik and not IK_AVAILABLE:
             print("Warning: IK requested but not available, falling back to angle-based")
 
@@ -134,10 +152,21 @@ class GaitController:
                     step_height=self.params["ik_step_height"],
                     stride_length=self.params["ik_stride_length"]
                 ))
-                print("IK mode enabled")
+                if self.generator_mode:
+                    self.gait_generator = GaitGenerator(
+                        cpg_config=CPGConfig(base_frequency=1.0 / DEFAULT_CYCLE_TIME),
+                        bezier_config=BezierConfig(
+                            stride_length=self.params["ik_stride_length"],
+                            stride_height=self.params["ik_step_height"],
+                        )
+                    )
+                    print("Generator mode enabled (CPG + Bezier)")
+                else:
+                    print("IK mode enabled")
             except Exception as e:
                 print(f"IK init failed: {e}, falling back to angle-based")
                 self.use_ik = False
+                self.generator_mode = False
 
         # Interpolation: track current angles for smooth movement
         self._current_angles = {}  # {channel: current_angle}
@@ -203,19 +232,67 @@ class GaitController:
         print(f"  Auto: height={self.params['step_height']} deg, length={self.params['step_length']} deg")
         print(f"  Mode: {'IK' if self.use_ik else 'Angle-based'}")
 
-    def set_mode(self, use_ik: bool) -> bool:
+    def set_gait_type(self, gait: str) -> bool:
         """
-        Switch between IK and angle-based gait modes.
+        Set the gait type when in generator mode.
+
+        Args:
+            gait: One of "walk", "trot", "pace", "bound"
+
+        Returns:
+            True if gait type was set successfully
+        """
+        if not self.generator_mode or self.gait_generator is None:
+            print("Gait type switching only available in generator mode")
+            return False
+        try:
+            self.gait_generator.set_gait_type(gait)
+            print(f"Gait type set to: {gait}")
+            return True
+        except Exception as e:
+            print(f"Failed to set gait type: {e}")
+            return False
+
+    def set_mode(self, use_ik: bool, generator_mode: bool = False) -> bool:
+        """
+        Switch between IK, generator, and angle-based gait modes.
 
         Args:
             use_ik: True for IK mode, False for angle-based
+            generator_mode: True for CPG-based gait generator (requires IK)
 
         Returns:
             True if mode was set successfully
         """
-        if use_ik and not IK_AVAILABLE:
+        if generator_mode and not GENERATOR_AVAILABLE:
+            print("GaitGenerator not available, staying in current mode")
+            return False
+        if (use_ik or generator_mode) and not IK_AVAILABLE:
             print("IK not available, staying in angle-based mode")
             return False
+
+        if generator_mode:
+            try:
+                if self.ik_interface is None:
+                    self.ik_interface = IKInterface(
+                        calibration_path=str(_DEFAULT_CALIBRATION),
+                        body_height=0.10
+                    )
+                if self.gait_generator is None:
+                    self.gait_generator = GaitGenerator(
+                        cpg_config=CPGConfig(base_frequency=1.0 / DEFAULT_CYCLE_TIME),
+                        bezier_config=BezierConfig(
+                            stride_length=self.params["ik_stride_length"],
+                            stride_height=self.params["ik_step_height"],
+                        )
+                    )
+                self.generator_mode = True
+                self.use_ik = True
+                print("Switched to generator mode")
+                return True
+            except Exception as e:
+                print(f"Failed to switch to generator mode: {e}")
+                return False
 
         if use_ik and not self.use_ik:
             # Switching to IK mode - initialize if needed
@@ -231,6 +308,7 @@ class GaitController:
                         stride_length=self.params["ik_stride_length"]
                     ))
                 self.use_ik = True
+                self.generator_mode = False
                 print("Switched to IK mode")
                 return True
             except Exception as e:
@@ -238,6 +316,7 @@ class GaitController:
                 return False
         elif not use_ik:
             self.use_ik = False
+            self.generator_mode = False
             print("Switched to angle-based mode")
             return True
 
@@ -254,6 +333,18 @@ class GaitController:
         if self.trajectory and ("ik_step_height" in kwargs or "ik_stride_length" in kwargs):
             self.trajectory.config.step_height = self.params["ik_step_height"]
             self.trajectory.config.stride_length = self.params["ik_stride_length"]
+
+        # Update gait generator if in generator mode
+        if self.generator_mode and self.gait_generator:
+            if "ik_step_height" in kwargs:
+                self.gait_generator.set_stride_params(height=self.params["ik_step_height"])
+            if "ik_stride_length" in kwargs:
+                self.gait_generator.set_stride_params(length=self.params["ik_stride_length"])
+            if "speed" in kwargs:
+                self.gait_generator.set_speed(self.params["speed"])
+            if "cycle_time" in kwargs:
+                self.gait_generator.cpg.config.base_frequency = 1.0 / self.params["cycle_time"]
+                self.gait_generator.set_speed(self.params["speed"])
 
     def set_turn_rate(self, rate: float):
         """
@@ -282,6 +373,10 @@ class GaitController:
         self.lateral_rate = max(-1.0, min(1.0, rate))
         if DEBUG and abs(rate) > 0.1:
             print(f"  Lateral rate: {self.lateral_rate:.2f}")
+
+        # Sync to gait generator if in generator mode
+        if self.generator_mode and self.gait_generator:
+            self.gait_generator.set_lateral_fraction(self.lateral_rate)
 
     def set_stand_height(self, knee_bend: int):
         """
@@ -636,11 +731,46 @@ class GaitController:
         self.set_servo(leg["knee"], knee, True)
         self.set_servo(leg["ankle"], ankle, True)
 
+    def _update_generator_angles(self) -> dict:
+        """
+        Update leg angles using the CPG gait generator.
+        Returns dict of {leg_id: {hip, knee, ankle}} angles.
+        """
+        if not self.generator_mode or not self.gait_generator or not self.ik_interface:
+            return {}
+
+        dt = GAIT_UPDATE_RATE
+        feet_rel = self.gait_generator.update(dt)
+        neutral = self.ik_interface.get_neutral_foot_positions()
+
+        # Convert relative to absolute foot positions
+        abs_feet = {}
+        for leg_id, rel in feet_rel.items():
+            n = neutral[leg_id]
+            abs_feet[leg_id] = [n[0] + rel[0], n[1] + rel[1], n[2] + rel[2]]
+
+        # Compute angles via IK
+        angles = self.ik_interface.feet_to_angles(abs_feet)
+
+        # Format as {leg_id: {hip, knee, ankle}}
+        result = {}
+        for leg_id in self.legs:
+            result[leg_id] = {
+                "hip": angles[leg_id][0],
+                "knee": angles[leg_id][1],
+                "ankle": angles[leg_id][2],
+            }
+        return result
+
     def _gait_loop(self):
         """Main gait loop - runs in separate thread"""
         print(f"\n{'=' * 60}")
         print(f"GAIT STARTED - Direction: {self.direction}")
-        print(f"Mode: {'IK' if self.use_ik else 'Angle-based'}")
+        if self.generator_mode:
+            print(f"Mode: Generator (CPG + Bezier)")
+            print(f"Gait type: {self.gait_generator.get_gait_type()}")
+        else:
+            print(f"Mode: {'IK' if self.use_ik else 'Angle-based'}")
         print(f"Params: cycle={self.params['cycle_time']}s, height={self.params['step_height']} deg, length={self.params['step_length']} deg")
         print(f"Pair A (swing first): {self.pair_a}")
         print(f"Pair B (stance first): {self.pair_b}")
@@ -653,40 +783,54 @@ class GaitController:
         last_phase_half = -1
 
         while self.running:
-            elapsed = time.time() - start_time
-            cycle_phase = (elapsed % cycle_time) / cycle_time
-            current_half = 0 if cycle_phase < 0.5 else 1
-
             # Read IMU once per iteration (not per leg)
             self._update_balance_corrections()
 
-            if DEBUG and current_half != last_phase_half:
-                if current_half == 0:
-                    print(f">> FL+RR lift, FR+RL ground")
-                else:
-                    print(f">> FR+RL lift, FL+RR ground")
-                last_phase_half = current_half
-
-            if cycle_phase < 0.5:
-                swing_phase = self._smooth_phase(cycle_phase * 2)
-                for leg_id in self.pair_a:
-                    angles = self._get_swing_angles(swing_phase, leg_id)
-                    self._apply_leg_angles(leg_id, angles)
-
-                stance_phase = cycle_phase * 2
-                for leg_id in self.pair_b:
-                    angles = self._get_stance_angles(stance_phase, leg_id)
-                    self._apply_leg_angles(leg_id, angles)
+            if self.generator_mode:
+                angles = self._update_generator_angles()
+                for leg_id in self.legs:
+                    if leg_id in angles:
+                        self._apply_leg_angles(leg_id, angles[leg_id])
+                if DEBUG:
+                    current_half = 0 if self.gait_generator.get_leg_phase("FL") < 0.5 else 1
+                    if current_half != last_phase_half:
+                        if current_half == 0:
+                            print(f">> FL swing, FR stance")
+                        else:
+                            print(f">> FL stance, FR swing")
+                        last_phase_half = current_half
             else:
-                stance_phase = (cycle_phase - 0.5) * 2
-                for leg_id in self.pair_a:
-                    angles = self._get_stance_angles(stance_phase, leg_id)
-                    self._apply_leg_angles(leg_id, angles)
+                elapsed = time.time() - start_time
+                cycle_phase = (elapsed % cycle_time) / cycle_time
+                current_half = 0 if cycle_phase < 0.5 else 1
 
-                swing_phase = self._smooth_phase((cycle_phase - 0.5) * 2)
-                for leg_id in self.pair_b:
-                    angles = self._get_swing_angles(swing_phase, leg_id)
-                    self._apply_leg_angles(leg_id, angles)
+                if DEBUG and current_half != last_phase_half:
+                    if current_half == 0:
+                        print(f">> FL+RR lift, FR+RL ground")
+                    else:
+                        print(f">> FR+RL lift, FL+RR ground")
+                    last_phase_half = current_half
+
+                if cycle_phase < 0.5:
+                    swing_phase = self._smooth_phase(cycle_phase * 2)
+                    for leg_id in self.pair_a:
+                        angles = self._get_swing_angles(swing_phase, leg_id)
+                        self._apply_leg_angles(leg_id, angles)
+
+                    stance_phase = cycle_phase * 2
+                    for leg_id in self.pair_b:
+                        angles = self._get_stance_angles(stance_phase, leg_id)
+                        self._apply_leg_angles(leg_id, angles)
+                else:
+                    stance_phase = (cycle_phase - 0.5) * 2
+                    for leg_id in self.pair_a:
+                        angles = self._get_stance_angles(stance_phase, leg_id)
+                        self._apply_leg_angles(leg_id, angles)
+
+                    swing_phase = self._smooth_phase((cycle_phase - 0.5) * 2)
+                    for leg_id in self.pair_b:
+                        angles = self._get_swing_angles(swing_phase, leg_id)
+                        self._apply_leg_angles(leg_id, angles)
 
             time.sleep(step_time)
 
@@ -724,6 +868,9 @@ class GaitController:
         time.sleep(0.3)
 
         self.direction = direction
+        if self.generator_mode and self.gait_generator:
+            self.gait_generator.set_direction(direction)
+            self.gait_generator.reset_phases()
         self.running = True
         self.thread = threading.Thread(target=self._gait_loop, daemon=True)
         self.thread.start()
@@ -749,7 +896,10 @@ class GaitController:
         """Execute a single step cycle (for testing) - starts from STAND position"""
         print(f"\n{'=' * 60}")
         print(f"SINGLE STEP - Direction: {direction}")
-        print(f"Mode: {'IK' if self.use_ik else 'Angle-based'}")
+        if self.generator_mode:
+            print(f"Mode: Generator (CPG + Bezier)")
+        else:
+            print(f"Mode: {'IK' if self.use_ik else 'Angle-based'}")
         print(f"Params: height={self.params['step_height']} deg, length={self.params['step_length']} deg")
         print(f"{'=' * 60}")
 
@@ -757,6 +907,10 @@ class GaitController:
         time.sleep(0.3)
 
         self.direction = direction
+        if self.generator_mode and self.gait_generator:
+            self.gait_generator.set_direction(direction)
+            self.gait_generator.reset_phases()
+
         cycle_time = self.params["cycle_time"] / self.params["speed"]
         step_time = SINGLE_STEP_UPDATE_RATE
         steps = int(cycle_time / step_time)
@@ -764,39 +918,52 @@ class GaitController:
         last_half = -1
 
         for i in range(steps):
-            cycle_phase = i / steps
-            current_half = 0 if cycle_phase < 0.5 else 1
-
             # Read IMU once per iteration
             self._update_balance_corrections()
 
-            if current_half != last_half:
-                if current_half == 0:
-                    print(f"\n>> Phase 1: FL+RR LIFT, FR+RL on ground")
-                else:
-                    print(f"\n>> Phase 2: FR+RL LIFT, FL+RR on ground")
-                last_half = current_half
-
-            if cycle_phase < 0.5:
-                swing_phase = self._smooth_phase(cycle_phase * 2)
-                for leg_id in self.pair_a:
-                    angles = self._get_swing_angles(swing_phase, leg_id)
-                    self._apply_leg_angles(leg_id, angles)
-
-                stance_phase = cycle_phase * 2
-                for leg_id in self.pair_b:
-                    angles = self._get_stance_angles(stance_phase, leg_id)
-                    self._apply_leg_angles(leg_id, angles)
+            if self.generator_mode:
+                angles = self._update_generator_angles()
+                for leg_id in self.legs:
+                    if leg_id in angles:
+                        self._apply_leg_angles(leg_id, angles[leg_id])
+                current_half = 0 if self.gait_generator.get_leg_phase("FL") < 0.5 else 1
+                if current_half != last_half:
+                    if current_half == 0:
+                        print(f"\n>> Phase 1: FL swing, FR stance")
+                    else:
+                        print(f"\n>> Phase 2: FL stance, FR swing")
+                    last_half = current_half
             else:
-                stance_phase = (cycle_phase - 0.5) * 2
-                for leg_id in self.pair_a:
-                    angles = self._get_stance_angles(stance_phase, leg_id)
-                    self._apply_leg_angles(leg_id, angles)
+                cycle_phase = i / steps
+                current_half = 0 if cycle_phase < 0.5 else 1
 
-                swing_phase = self._smooth_phase((cycle_phase - 0.5) * 2)
-                for leg_id in self.pair_b:
-                    angles = self._get_swing_angles(swing_phase, leg_id)
-                    self._apply_leg_angles(leg_id, angles)
+                if current_half != last_half:
+                    if current_half == 0:
+                        print(f"\n>> Phase 1: FL+RR LIFT, FR+RL on ground")
+                    else:
+                        print(f"\n>> Phase 2: FR+RL LIFT, FL+RR on ground")
+                    last_half = current_half
+
+                if cycle_phase < 0.5:
+                    swing_phase = self._smooth_phase(cycle_phase * 2)
+                    for leg_id in self.pair_a:
+                        angles = self._get_swing_angles(swing_phase, leg_id)
+                        self._apply_leg_angles(leg_id, angles)
+
+                    stance_phase = cycle_phase * 2
+                    for leg_id in self.pair_b:
+                        angles = self._get_stance_angles(stance_phase, leg_id)
+                        self._apply_leg_angles(leg_id, angles)
+                else:
+                    stance_phase = (cycle_phase - 0.5) * 2
+                    for leg_id in self.pair_a:
+                        angles = self._get_stance_angles(stance_phase, leg_id)
+                        self._apply_leg_angles(leg_id, angles)
+
+                    swing_phase = self._smooth_phase((cycle_phase - 0.5) * 2)
+                    for leg_id in self.pair_b:
+                        angles = self._get_swing_angles(swing_phase, leg_id)
+                        self._apply_leg_angles(leg_id, angles)
 
             time.sleep(step_time)
 
@@ -807,8 +974,8 @@ class GaitController:
 
 
 # Demo function for testing
-def demo_gait(set_servo_func, use_ik=False):
+def demo_gait(set_servo_func, use_ik=False, generator_mode=False):
     """Demo the gait - single step forward"""
-    controller = GaitController(set_servo_func, use_ik=use_ik)
+    controller = GaitController(set_servo_func, use_ik=use_ik, generator_mode=generator_mode)
     controller.single_step("forward")
     return controller
