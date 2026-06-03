@@ -105,6 +105,7 @@ CLAUDE.md
 *.log
 logs/
 calibration.json
+tuning.json
 calibration_backup*.json
 tuning_backup*.json
 

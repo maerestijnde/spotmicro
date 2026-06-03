@@ -1093,8 +1093,12 @@ async def update_servo_calibration(channel: int, data: dict):
     """Update calibration for a specific servo"""
     if calibration and channel in calibration.servos:
         calibration.servos[channel].update(data)
-        save_calibration()
-        return {"status": "ok", "channel": channel}
+        # Keep this endpoint in-memory only; callers can persist explicitly via /api/calibration/save.
+        # Optional compatibility: pass {"autosave": true} when immediate disk save is desired.
+        if data.get("autosave"):
+            save_calibration()
+            return {"status": "ok", "channel": channel, "saved": True}
+        return {"status": "ok", "channel": channel, "saved": False}
     return {"status": "error", "message": "Invalid channel"}
 
 @app.post("/api/calibration/save")
