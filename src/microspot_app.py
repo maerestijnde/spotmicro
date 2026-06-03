@@ -588,10 +588,11 @@ def set_servo(channel, angle, apply_offset=True):
         # Logging: show calibration being applied
         if channel in calibration.servos and calibration.servos[channel]["calibrated"]:
             servo_info = calibration.servos[channel]
-            delta = angle - 90
-            print(f"  Ch{channel} ({servo_info['label']:<20}): "
-                  f"Cmd={angle:>3}° → Actual={int(actual_angle):>3}° "
-                  f"(neutral={servo_info['neutral_angle']:>3}°, delta={delta:+3}°)")
+            # DEBUG: uncomment below for per-servo calibration logging
+            # delta = angle - 90
+            # print(f"  Ch{channel} ({servo_info['label']:<20}): "
+            #       f"Cmd={angle:>3}° → Actual={int(actual_angle):>3}° "
+            #       f"(neutral={servo_info['neutral_angle']:>3}°, delta={delta:+3}°)")
     else:
         actual_angle = angle
 

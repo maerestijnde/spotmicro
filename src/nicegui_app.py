@@ -798,8 +798,8 @@ async def control_page():
         await state.update_slow()
         balance_switch.value = state.balance_enabled
 
-    ui.timer(0.2, fast_badges)
-    ui.timer(0.333, scene_update)
+    ui.timer(0.5, fast_badges)      # was 0.2 (5Hz) → 0.5 (2Hz) reduce Pi load
+    ui.timer(0.5, scene_update)     # was 0.333 (3Hz) → 0.5 (2Hz)
     ui.timer(2.0, slow_update)
 
 
@@ -929,7 +929,7 @@ async def servos_page():
                 if ch in servo_labels:
                     servo_labels[ch].text = str(int(angle))
 
-    ui.timer(0.2, update_servos)
+    ui.timer(0.5, update_servos)    # was 0.2 (5Hz) → 0.5 (2Hz)
 
 
 # ============================================================================
