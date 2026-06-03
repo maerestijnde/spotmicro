@@ -876,8 +876,158 @@ async def servos_page():
     # Calibration section
     ui.separator().classes("my-4")
     with ui.expansion("Calibration Tools", icon="build").classes("w-full"):
+        # --- Snapshot store (client-side) ---
+        snapshot_store = ui.column().classes("w-full mb-3")
+
+        async def refresh_snapshots():
+            snapshot_store.clear()
+            with snapshot_store:
+                snapshots = app.storage.user.get("servo_snapshots", {})
+                if snapshots:
+                    ui.label("Snapshots").classes("text-gray-300 font-bold mb-2")
+                    with ui.row().classes("gap-2 flex-wrap"):
+                        for name, angles in snapshots.items():
+                            async def load_snapshot(n=name, a=angles):
+                                for ch in range(12):
+                                    if ch in servo_sliders and str(ch) in a:
+                                        val = int(a[str(ch)])
+                                        servo_sliders[ch].value = val
+                                        servo_labels[ch].text = str(val)
+                                        state.mark_slider_touched(ch)
+                                        await api_post(f"/api/servo/{ch}", {"angle": val})
+                                ui.notify(f"Loaded snapshot '{n}'", type="positive")
+
+                            async def delete_snapshot(n=name):
+                                snaps = app.storage.user.get("servo_snapshots", {})
+                                snaps.pop(n, None)
+                                app.storage.user["servo_snapshots"] = snaps
+                                await refresh_snapshots()
+
+                            with ui.card().classes("px-3 py-1").style("background: #1a1a3a;"):
+                                with ui.row().classes("items-center gap-2"):
+                                    ui.label(name).classes("text-cyan-400 text-sm font-bold")
+                                    ui.button(icon="play_arrow", on_click=load_snapshot).props("dense flat size=xs color=green")
+                                    ui.button(icon="delete", on_click=delete_snapshot).props("dense flat size=xs color=red")
+
+                with ui.row().classes("gap-2 items-end mt-2"):
+                    snap_name = ui.input("Snapshot Name", placeholder="e.g. stand_tall").classes("w-48")
+                    async def save_snapshot():
+                        name = snap_name.value.strip()
+                        if not name:
+                            ui.notify("Enter a snapshot name", type="warning")
+                            return
+                        angles = {str(ch): servo_sliders[ch].value for ch in range(12) if ch in servo_sliders}
+                        snaps = app.storage.user.get("servo_snapshots", {})
+                        snaps[name] = angles
+                        app.storage.user["servo_snapshots"] = snaps
+                        snap_name.value = ""
+                        await refresh_snapshots()
+                        ui.notify(f"Snapshot '{name}' saved", type="positive")
+                    ui.button("Save Snapshot", on_click=save_snapshot, color="green").props("dense unelevated")
+
+        await refresh_snapshots()
+
+        ui.separator().classes("my-3")
+
+        # --- All servos in calibration tools (reorderable) ---
+        cal_container = ui.column().classes("w-full")
+        # Default order: by channel
+        default_order = list(range(12))
+
+        async def rebuild_cal_view(order=None):
+            if order is None:
+                order = app.storage.user.get("servo_cal_order", default_order)
+            cal_container.clear()
+            with cal_container:
+                ui.label("All Servos (reorderable)").classes("text-gray-300 font-bold mb-2")
+
+                # Sort selector
+                async def sort_changed(e):
+                    mode = e.value
+                    if mode == "channel":
+                        new_order = list(range(12))
+                    elif mode == "leg":
+                        new_order = [0,1,2, 3,4,5, 6,7,8, 9,10,11]
+                    elif mode == "joint":
+                        new_order = [0,3,6,9, 1,4,7,10, 2,5,8,11]
+                    else:
+                        new_order = app.storage.user.get("servo_cal_order", default_order)
+                    app.storage.user["servo_cal_order"] = new_order
+                    await rebuild_cal_view(new_order)
+
+                sort_select = ui.select(
+                    {"channel": "By Channel", "leg": "By Leg (FL,FR,RL,RR)", "joint": "By Joint (Hip,Knee,Ankle)"},
+                    value="channel", label="Sort Order"
+                ).classes("w-56 mb-2")
+                sort_select.on_value_change(sort_changed)
+
+                # Grid of servos
+                with ui.grid(columns=3).classes("w-full gap-3"):
+                    for ch in order:
+                        if ch not in servo_sliders:
+                            continue
+                        leg_id = None
+                        for lid, cfg in LEG_CONFIG.items():
+                            if ch in cfg["channels"]:
+                                leg_id = lid
+                                break
+                        color = LEG_COLORS.get(leg_id, "#888")
+                        name = SERVO_NAMES.get(ch, f"Ch{ch}")
+
+                        with ui.card().classes("w-full px-2 py-1").style(f"border-left: 3px solid {color};"):
+                            with ui.row().classes("items-center gap-1 mb-1"):
+                                ui.label(name).classes("text-xs font-bold flex-grow").style(f"color: {color};")
+
+                                async def move_up(c=ch):
+                                    cur = app.storage.user.get("servo_cal_order", default_order)
+                                    idx = cur.index(c)
+                                    if idx > 0:
+                                        cur[idx], cur[idx-1] = cur[idx-1], cur[idx]
+                                        app.storage.user["servo_cal_order"] = cur
+                                        await rebuild_cal_view(cur)
+
+                                async def move_down(c=ch):
+                                    cur = app.storage.user.get("servo_cal_order", default_order)
+                                    idx = cur.index(c)
+                                    if idx < len(cur) - 1:
+                                        cur[idx], cur[idx+1] = cur[idx+1], cur[idx]
+                                        app.storage.user["servo_cal_order"] = cur
+                                        await rebuild_cal_view(cur)
+
+                                ui.button(icon="arrow_upward", on_click=move_up).props("dense flat size=xs").classes("text-gray-500")
+                                ui.button(icon="arrow_downward", on_click=move_down).props("dense flat size=xs").classes("text-gray-500")
+
+                            # Live value label
+                            cal_lbl = ui.label(str(int(servo_sliders[ch].value))).classes("text-cyan-400 text-xs font-mono")
+                            # We don't create a new slider; instead use a small nudge control tied to the main slider
+                            with ui.row().classes("gap-1 items-center"):
+                                for delta in [-5, -1, 1, 5]:
+                                    sign = "+" if delta > 0 else ""
+                                    async def cal_nudge(d=delta, c=ch, lb=cal_lbl):
+                                        new_val = max(0, min(180, servo_sliders[c].value + d))
+                                        servo_sliders[c].value = new_val
+                                        servo_labels[c].text = str(int(new_val))
+                                        lb.text = str(int(new_val))
+                                        state.mark_slider_touched(c)
+                                        await api_post(f"/api/servo/{c}", {"angle": new_val})
+                                    ui.button(f"{sign}{delta}", on_click=cal_nudge).props("dense flat size=xs").classes("text-gray-400")
+
+                            # Quick save neutral for this servo
+                            async def save_this_neutral(c=ch):
+                                angle = servo_sliders[c].value
+                                await api_post(f"/api/calibration/servo/{c}", {"neutral_angle": angle})
+                                await api_post("/api/calibration/save")
+                                ui.notify(f"Saved {SERVO_NAMES.get(c, c)}: {angle}", type="positive")
+
+                            ui.button("Save Neutral", on_click=save_this_neutral).props("dense flat size=xs color=green").classes("mt-1")
+
+        await rebuild_cal_view()
+
+        ui.separator().classes("my-3")
+
+        # --- Single servo fine-tune (legacy but useful) ---
         with ui.card().classes("w-full"):
-            ui.label("Fine-tune servo positions").classes("text-gray-400 mb-2")
+            ui.label("Fine-tune single servo").classes("text-gray-400 mb-2")
 
             cal_channel = ui.select(
                 {ch: name for ch, name in SERVO_NAMES.items()},
