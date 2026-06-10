@@ -5,8 +5,14 @@ import numpy as np
 from math import degrees
 import json
 from pathlib import Path
-from kinematics.spot_micro_stick_figure import SpotMicroStickFigure, SpotMicroLeg
-from kinematics.utilities import transformations
+try:
+    from kinematics.spot_micro_stick_figure import SpotMicroStickFigure, SpotMicroLeg
+    from kinematics.utilities import transformations
+except ImportError as _ik_import_err:
+    raise ImportError(
+        f"kinematics submodule not available ({_ik_import_err}). "
+        "Run: git submodule update --init  OR  pip3 install matplotlib"
+    ) from _ik_import_err
 
 # Default calibration path
 _CALIBRATION_FILE = Path(__file__).parent / "calibration.json"

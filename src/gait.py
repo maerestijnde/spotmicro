@@ -320,8 +320,10 @@ class GaitController:
                 print(f"Failed to switch to crawl mode: {e}")
                 return False
 
-        # If disabling crawl mode, fall through to other modes
+        # If disabling crawl mode, ensure crawl thread is stopped before switching
         if self.crawl_mode and not crawl_mode:
+            if self.crawl_controller and self.crawl_controller.is_running():
+                self.crawl_controller.stop()
             self.crawl_mode = False
             print("Crawl mode disabled")
 

@@ -60,8 +60,15 @@ def create_gait_controls():
         if result and result.get("success"):
             ui.notify(f"Mode → {mode_options.get(mode_select.value, mode_select.value)}", type="positive")
         else:
-            err = (result or {}).get("error", "failed")
-            ui.notify(f"Mode switch failed: {err}", type="negative")
+            ik_ok = (result or {}).get("ik_available", True)
+            err = (result or {}).get("error", "")
+            if not ik_ok and mode_select.value == "ik":
+                ui.notify(
+                    "IK not available — kinematics submodule missing or matplotlib not installed",
+                    type="negative",
+                )
+            else:
+                ui.notify(f"Mode switch failed: {err or 'unknown error'}", type="negative")
             await _load_mode()
 
     mode_select.on("update:model-value", _change_mode)
