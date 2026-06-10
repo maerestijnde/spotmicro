@@ -459,6 +459,58 @@ class BalanceController:
             "kd": round(self.kd, 4),
         }
 
+    def get_cached_correction(self):
+        """
+        Calculate balance correction from cached angles (no I2C read).
+        Use this in the gait loop to avoid bus contention.
+        """
+        pitch, roll = self._last_pitch, self._last_roll
+
+        now = time.time()
+        dt = now - self._last_correction_time
+        self._last_correction_time = now
+        dt = max(0.001, min(0.1, dt))
+
+        # Errors relative to level (0°)
+        pitch_error = pitch
+        roll_error = roll
+
+        # Proportional term
+        pitch_p = pitch_error * self.balance_gain
+        roll_p = roll_error * self.balance_gain
+
+        # Integral term with anti-windup
+        self._pitch_integral += pitch_error * dt
+        self._roll_integral += roll_error * dt
+        self._pitch_integral = max(-self._integral_limit, min(self._integral_limit, self._pitch_integral))
+        self._roll_integral = max(-self._integral_limit, min(self._integral_limit, self._roll_integral))
+
+        pitch_i = self._pitch_integral * self.ki
+        roll_i = self._roll_integral * self.ki
+
+        # Derivative term
+        pitch_d = (pitch_error - self._last_pitch_error) / dt * self.kd
+        roll_d = (roll_error - self._last_roll_error) / dt * self.kd
+
+        self._last_pitch_error = pitch_error
+        self._last_roll_error = roll_error
+
+        pitch_total = pitch_p + pitch_i + pitch_d
+        roll_total = roll_p + roll_i + roll_d
+
+        corrections = {}
+
+        # Front legs
+        corrections['FL'] = -pitch_total - roll_total * 0.5
+        corrections['FR'] = -pitch_total + roll_total * 0.5
+
+        # Rear legs - NEGATIVE pitch correction (lift rear when tilting forward)
+        # 0.5 factor makes rear legs less aggressive than front
+        corrections['RL'] = -pitch_total * 0.5 - roll_total * 0.5
+        corrections['RR'] = -pitch_total * 0.5 + roll_total * 0.5
+
+        return corrections
+
     def get_correction(self):
         """
         Calculate balance correction for each leg using PID-style control.

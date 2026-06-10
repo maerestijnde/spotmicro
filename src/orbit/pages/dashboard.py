@@ -120,6 +120,6 @@ async def dashboard_page():
             STATUS_GREEN if state.balance_enabled else TEXT_MUTED,
         )
 
-    ui.timer(0.2, fast_update)
-    ui.timer(0.333, scene_update)
+    ui.timer(0.5, fast_update)      # was 0.2 (5Hz) → 0.5 (2Hz) reduce Pi load
+    ui.timer(0.5, scene_update)     # was 0.333 (3Hz) → 0.5 (2Hz)
     ui.timer(2.0, slow_update)

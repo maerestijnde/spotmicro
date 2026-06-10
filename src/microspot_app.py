@@ -204,6 +204,7 @@ QUAD_CONFIG = {
 
 # Servo state
 servos = {}
+_servo_channel_map = {}  # channel -> servo.Servo object (built in init_servos)
 servo_angles = {i: 90 for i in range(12)}  # Only 12 servos (0-11)
 
 
@@ -503,6 +504,7 @@ def apply_tuning_to_gait():
         log_init.info(f"Applied tuning to gait controller")
 
 def init_servos():
+    global _servo_channel_map
     if not HW:
         print("Simulation mode - no servos")
         return
@@ -513,12 +515,14 @@ def init_servos():
                 key = f"{leg_id}_{i}"
                 # Get the correct PCA board and physical channel
                 pca_board, physical_channel = get_pca_and_channel(channel)
-                servos[key] = servo.Servo(
+                srv = servo.Servo(
                     pca_board.channels[physical_channel],
                     min_pulse=SERVO_PARAMS["min_pulse"],
                     max_pulse=SERVO_PARAMS["max_pulse"],
                     actuation_range=SERVO_PARAMS["actuation_range"]
                 )
+                servos[key] = srv
+                _servo_channel_map[channel] = srv
                 # Don't set angle yet - wait for goto_calibrated_neutrals
                 servo_angles[channel] = 90
         print(f"✓ Initialized {len(servos)} servos (dual PCA9685)")
@@ -549,7 +553,7 @@ def goto_calibrated_neutrals():
     print(f"{'='*60}\n")
 
 _pca_check_counter = 0
-_PCA_CHECK_INTERVAL = 50  # Check every ~50 servo writes (~1s at 50Hz gait)
+_PCA_CHECK_INTERVAL = 500  # Check every ~500 servo writes (~10s at 50Hz gait)
 
 def _check_pca_health():
     """Detect and recover PCA9685 brownout-reset (chip reverts to sleep mode)."""
@@ -585,14 +589,6 @@ def set_servo(channel, angle, apply_offset=True):
 
     if apply_offset and calibration:
         actual_angle = calibration.apply_to_angle(channel, angle)
-        # Logging: show calibration being applied
-        if channel in calibration.servos and calibration.servos[channel]["calibrated"]:
-            servo_info = calibration.servos[channel]
-            # DEBUG: uncomment below for per-servo calibration logging
-            # delta = angle - 90
-            # print(f"  Ch{channel} ({servo_info['label']:<20}): "
-            #       f"Cmd={angle:>3}° → Actual={int(actual_angle):>3}° "
-            #       f"(neutral={servo_info['neutral_angle']:>3}°, delta={delta:+3}°)")
     else:
         actual_angle = angle
 
@@ -601,17 +597,15 @@ def set_servo(channel, angle, apply_offset=True):
     if not HW:
         return True
 
-    try:
-        for key, srv in servos.items():
-            leg_id, joint_idx = key.split('_')
-            leg_channels = QUAD_CONFIG[leg_id]["channels"]
-            if leg_channels[int(joint_idx)] == channel:
-                srv.angle = actual_angle
-                return True
-        return False
-    except Exception as e:
-        print(f"✗ Error ch{channel}: {e}")
-        return False
+    srv = _servo_channel_map.get(channel)
+    if srv is not None:
+        try:
+            srv.angle = actual_angle
+            return True
+        except Exception as e:
+            print(f"✗ Error ch{channel}: {e}")
+            return False
+    return False
 
 def move_servo_smooth(channel, target_angle, duration_ms=500, apply_offset=True):
     """
@@ -873,6 +867,11 @@ def set_foot_position(leg_id, x, y, z):
     except Exception as e:
         log_api.error(f"set_foot_position error: {e}")
         return False
+
+async def set_pose_async(pose_name, duration_ms=0):
+    """Async wrapper for set_pose that offloads blocking smooth moves to a thread."""
+    return await asyncio.to_thread(set_pose, pose_name, duration_ms)
+
 
 def set_pose(pose_name, duration_ms=0):
     """
@@ -1204,7 +1203,7 @@ async def set_pose_endpoint(pose_name: str, data: dict = {}):
     if pose_name not in POSES:
         return {"status": "error", "message": f"Unknown pose: {pose_name}", "available": list(POSES.keys())}
     duration_ms = data.get("duration_ms", 500)
-    success = set_pose(pose_name, duration_ms)
+    success = await set_pose_async(pose_name, duration_ms)
     if success:
         _emit_event(f"pose_{pose_name}")
     return {"status": "ok" if success else "error", "pose": pose_name, "body_state": body_state, "duration_ms": duration_ms}
@@ -1558,7 +1557,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             elif cmd == "pose":
                 pose_name = data.get("pose")
-                success = set_pose(pose_name)
+                success = await set_pose_async(pose_name)
                 await ws.send_json({"status": "ok" if success else "error", "pose": pose_name})
 
             elif cmd == "reset":

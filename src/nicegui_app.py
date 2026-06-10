@@ -1440,7 +1440,7 @@ async def imu_page():
 
         imu_balance_switch.value = state.balance_enabled
 
-    ui.timer(0.2, update_imu_fast)
+    ui.timer(0.5, update_imu_fast)   # was 0.2 (5Hz) → 0.5 (2Hz)
     ui.timer(2.0, update_imu_slow)
 
 

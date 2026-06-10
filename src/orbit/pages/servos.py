@@ -137,4 +137,4 @@ async def servos_page():
                 if ch in servo_labels:
                     servo_labels[ch].text = str(int(angle))
 
-    ui.timer(0.2, update_servos)
+    ui.timer(0.5, update_servos)    # was 0.2 (5Hz) → 0.5 (2Hz)

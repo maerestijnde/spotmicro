@@ -777,11 +777,12 @@ class GaitController:
         return new
 
     def _update_balance_corrections(self):
-        """Read IMU once per gait cycle and cache corrections for all legs."""
+        """Read IMU once per gait cycle and cache corrections for all legs.
+        Uses cached correction to avoid I2C bus contention with background reader."""
         if self.use_balance and self.balance:
             try:
-                self._balance_corrections = self.balance.get_correction()
-            except:
+                self._balance_corrections = self.balance.get_cached_correction()
+            except Exception:
                 pass
         else:
             self._balance_corrections = {}

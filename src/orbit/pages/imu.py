@@ -215,5 +215,5 @@ async def imu_page():
         refs["stability_footer_badge"]._props["color"] = color_map.get(stab_color, "red")
         refs["stability_footer_badge"].update()
 
-    ui.timer(0.2, update_imu_fast)
+    ui.timer(0.5, update_imu_fast)   # was 0.2 (5Hz) → 0.5 (2Hz)
     ui.timer(2.0, update_imu_slow)
