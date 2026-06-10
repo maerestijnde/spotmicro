@@ -25,7 +25,7 @@ def _divergence_color(deg: float) -> str:
     return STATUS_GREEN
 
 
-def create_shadow_panel() -> dict:
+def create_shadow_panel(client=None) -> dict:
     """Create shadow comparison panel. Returns dict of updatable refs."""
     refs = {}
 
@@ -110,7 +110,10 @@ def create_shadow_panel() -> dict:
             bars_col.clear()
             refs["ik_stats_label"].text = ""
 
-    state.subscribe(on_shadow_telemetry)
+    if client:
+        state.subscribe_scoped(on_shadow_telemetry, client)
+    else:
+        state.subscribe(on_shadow_telemetry)
 
     # ---- IK Stand Validation ----
     ui.separator().classes("my-2")

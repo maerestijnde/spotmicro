@@ -7,7 +7,7 @@ from orbit.state import api_get, api_post, state
 from orbit.theme import TEXT_MUTED, STATUS_GREEN
 
 
-def create_gait_controls():
+def create_gait_controls(client=None):
     """Create Walk/Stop/Step buttons + mode selector. Returns None."""
     # ---- Walk / Stop / Step ----
     with ui.row().classes("gap-2 w-full mb-2"):
@@ -80,7 +80,10 @@ def create_gait_controls():
         if new_mode in mode_options and mode_select.value != new_mode:
             mode_select.value = new_mode
 
-    state.subscribe(_on_mode_telemetry)
+    if client:
+        state.subscribe_scoped(_on_mode_telemetry, client)
+    else:
+        state.subscribe(_on_mode_telemetry)
 
     # Load initial mode
     ui.timer(0, _load_mode, once=True)

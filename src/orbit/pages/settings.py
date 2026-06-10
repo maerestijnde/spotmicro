@@ -1,6 +1,6 @@
 """Orbit UI - Settings page with Controller/Poses/Recordings/System tabs."""
 
-from nicegui import ui
+from nicegui import ui, Client
 
 from orbit.layout import create_shell
 from orbit.state import state, api_get, api_post, ensure_client, API_URL
@@ -8,8 +8,8 @@ from orbit.theme import ACCENT_CYAN, TEXT_MUTED, TEXT_PRIMARY
 
 
 @ui.page("/settings")
-async def settings_page():
-    refs = create_shell("Settings")
+async def settings_page(client: Client):
+    refs = create_shell("Settings", client=client)
 
     ui.label("Settings").classes("text-2xl font-bold text-white mb-4")
 

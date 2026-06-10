@@ -166,6 +166,18 @@ class RobotState:
         if callback in self._telemetry_subscribers:
             self._telemetry_subscribers.remove(callback)
 
+    def subscribe_scoped(self, callback: Callable, client) -> None:
+        """Subscribe + auto-unsubscribe when the NiceGUI client disconnects.
+
+        Prevents subscriber accumulation when users navigate between pages.
+        Usage:
+            state.subscribe_scoped(my_callback, client)
+        """
+        self.subscribe(callback)
+        async def _cleanup():
+            self.unsubscribe(callback)
+        client.on_disconnect(_cleanup)
+
     def subscribe_events(self, callback: Callable):
         """Register a coroutine called on discrete events: async def cb(event: dict)."""
         if callback not in self._event_subscribers:

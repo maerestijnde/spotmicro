@@ -1,6 +1,6 @@
 """Orbit UI - Tuning page with Stand/Balance/Gait tabs."""
 
-from nicegui import ui
+from nicegui import ui, Client
 
 from orbit.layout import create_shell
 from orbit.state import state, api_get, api_post
@@ -8,8 +8,8 @@ from orbit.theme import TEXT_MUTED
 
 
 @ui.page("/tuning")
-async def tuning_page():
-    refs = create_shell("Tuning")
+async def tuning_page(client: Client):
+    refs = create_shell("Tuning", client=client)
 
     ui.label("Tuning").classes("text-2xl font-bold text-white mb-4")
 

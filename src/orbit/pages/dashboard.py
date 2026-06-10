@@ -1,7 +1,7 @@
 """
 Orbit UI - Dashboard page: Hero 3D view + status bar + controls + activity feed.
 """
-from nicegui import ui
+from nicegui import ui, Client
 
 from orbit.layout import create_shell
 from orbit.theme import ACCENT_CYAN, STATUS_GREEN, STATUS_YELLOW, STATUS_RED, TEXT_MUTED
@@ -17,8 +17,8 @@ from orbit.components.shadow_panel import create_shadow_panel
 
 
 @ui.page("/")
-async def dashboard_page():
-    refs = create_shell(page_title="Dashboard")
+async def dashboard_page(client: Client):
+    refs = create_shell(page_title="Dashboard", client=client)
 
     robot_scene = RobotScene()
 
@@ -38,7 +38,7 @@ async def dashboard_page():
             # Walking controls
             with ui.card().classes("w-full mb-3"):
                 ui.label("Walking").classes("text-gray-300 font-bold mb-2")
-                create_gait_controls()
+                create_gait_controls(client=client)
 
             # Poses
             with ui.card().classes("w-full mb-3"):
@@ -51,7 +51,7 @@ async def dashboard_page():
 
             # IK Shadow compare
             with ui.card().classes("w-full mb-3"):
-                create_shadow_panel()
+                create_shadow_panel(client=client)
 
             # Body control
             with ui.card().classes("w-full"):
@@ -105,7 +105,7 @@ async def dashboard_page():
         _refresh_ui()
 
     # Register subscriber — unregister on page leave (NiceGUI handles cleanup via weak refs)
-    state.subscribe(on_telemetry)
+    state.subscribe_scoped(on_telemetry, client)
 
     async def slow_update():
         """2s polling: fetch slow data that isn't in telemetry (gait/balance/stability details)."""

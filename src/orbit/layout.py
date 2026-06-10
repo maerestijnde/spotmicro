@@ -6,7 +6,7 @@ Usage:
     refs = create_shell(page_title="Dashboard")
     # refs["connection_badge"], refs["pitch_footer"], etc.
 """
-from nicegui import ui
+from nicegui import ui, Client
 
 from orbit.theme import (
     apply_theme, BG_SIDEBAR, BORDER_COLOR, ACCENT_BLUE, ACCENT_CYAN,
@@ -28,7 +28,7 @@ NAV_ITEMS = [
 ]
 
 
-def create_shell(page_title: str = "Dashboard") -> dict:
+def create_shell(page_title: str = "Dashboard", client: Client = None) -> dict:
     """Build the full page shell and return updatable UI refs.
 
     Returns dict with keys:
@@ -138,7 +138,10 @@ def create_shell(page_title: str = "Dashboard") -> dict:
                 refs["header"].update()
                 refs["estop_reset_btn"].update()
 
-            state.subscribe(on_estop_telemetry)
+            if client:
+                state.subscribe_scoped(on_estop_telemetry, client)
+            else:
+                state.subscribe(on_estop_telemetry)
 
     # ------------------------------------------------------------- Mini-sidebar
     with ui.left_drawer(value=True).props("mini mini-to-overlay bordered").classes("p-0").style(

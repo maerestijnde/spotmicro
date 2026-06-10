@@ -4,7 +4,7 @@ Orbit UI - Calibration page.
 Ported from Streamlit components/calibration.py + servo_page.py.
 Blocking time.sleep() calls replaced with async move_servo_smooth endpoint.
 """
-from nicegui import ui
+from nicegui import ui, Client
 
 from orbit.layout import create_shell
 from orbit.state import api_get, api_post, state
@@ -33,8 +33,8 @@ LEGS = [
 
 
 @ui.page("/calibration")
-async def calibration_page():
-    refs = create_shell(page_title="Calibration")
+async def calibration_page(client: Client):
+    refs = create_shell(page_title="Calibration", client=client)
 
     # ---- Load calibration data ----
     calib_data = await api_get("/api/calibration") or {}
@@ -297,4 +297,4 @@ async def calibration_page():
         refs["roll_footer"].text = f"R: {state.roll:.1f}"
         refs["uptime_label"].text = state.uptime
 
-    state.subscribe(on_cal_telemetry)
+    state.subscribe_scoped(on_cal_telemetry, client)

@@ -2,7 +2,7 @@
 
 import asyncio
 
-from nicegui import ui
+from nicegui import ui, Client
 
 from orbit.layout import create_shell
 from orbit.state import (
@@ -13,8 +13,8 @@ from orbit.theme import ACCENT_CYAN, TEXT_MUTED, STATUS_GREEN, STATUS_RED
 
 
 @ui.page("/imu")
-async def imu_page():
-    refs = create_shell("IMU")
+async def imu_page(client: Client):
+    refs = create_shell("IMU", client=client)
 
     ui.label("IMU Monitor").classes("text-2xl font-bold text-white mb-4")
 
@@ -203,7 +203,7 @@ async def imu_page():
         _refresh_imu_ui()
         _update_chart()
 
-    state.subscribe(on_imu_telemetry)
+    state.subscribe_scoped(on_imu_telemetry, client)
 
     # Timer: 2s slow stability/balance (polling OK — not time-critical)
     async def update_imu_slow():

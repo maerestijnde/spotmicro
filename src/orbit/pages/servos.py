@@ -1,6 +1,6 @@
 """Orbit UI - Servo control page with 2x2 leg cards."""
 
-from nicegui import ui
+from nicegui import ui, Client
 
 from orbit.layout import create_shell
 from orbit.state import state, api_post, SERVO_NAMES, LEG_CONFIG
@@ -9,8 +9,8 @@ from orbit.kinematics import get_servo_angle
 
 
 @ui.page("/servos")
-async def servos_page():
-    refs = create_shell("Servos")
+async def servos_page(client: Client):
+    refs = create_shell("Servos", client=client)
 
     ui.label("Servo Control").classes("text-2xl font-bold text-white mb-4")
 
@@ -138,7 +138,7 @@ async def servos_page():
     async def on_servo_telemetry(frame: dict):
         _refresh_servo_ui()
 
-    state.subscribe(on_servo_telemetry)
+    state.subscribe_scoped(on_servo_telemetry, client)
 
     async def fallback_servo_update():
         if not state.ws_connected:
