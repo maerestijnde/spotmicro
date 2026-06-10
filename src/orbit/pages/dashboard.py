@@ -13,6 +13,7 @@ from orbit.components.gait_controls import create_gait_controls
 from orbit.components.pose_selector import create_pose_selector
 from orbit.components.balance_panel import create_balance_panel
 from orbit.components.body_controls import create_body_controls
+from orbit.components.shadow_panel import create_shadow_panel
 
 
 @ui.page("/")
@@ -48,6 +49,10 @@ async def dashboard_page():
                 ui.label("Balance").classes("text-gray-300 font-bold mb-2")
                 balance_switch = create_balance_panel()
 
+            # IK Shadow compare
+            with ui.card().classes("w-full mb-3"):
+                create_shadow_panel()
+
             # Body control
             with ui.card().classes("w-full"):
                 ui.label("Body Control").classes("text-gray-300 font-bold mb-2")
@@ -56,16 +61,15 @@ async def dashboard_page():
     # ---- Activity feed (bottom) ----
     feed_container = create_activity_feed()
 
-    # ---- Timers ----
+    # ---- WS subscriber + fallback timer ----
     _last_feed_len = [0]
 
-    async def fast_update():
-        """5Hz: fetch fast data, update status bar + footer."""
-        await state.update_fast()
-
+    def _refresh_ui():
+        """Update all UI elements from current state. Called by WS subscriber or fallback timer."""
         # Connection badge
+        ws_ok = state.ws_connected
         refs["connection_badge"].text = "Connected" if state.connected else "Disconnected"
-        refs["connection_badge"]._props["color"] = "green" if state.connected else "red"
+        refs["connection_badge"]._props["color"] = "green" if ws_ok else ("orange" if state.connected else "red")
         refs["connection_badge"].update()
 
         # Footer pitch/roll
@@ -95,12 +99,16 @@ async def dashboard_page():
             _last_feed_len[0] = current_len
             refresh_feed(feed_container, state.activity_log)
 
-    async def scene_update():
-        """3Hz: update 3D robot visualization."""
+    async def on_telemetry(frame: dict):
+        """Called by WS subscriber on every telemetry frame (~10Hz from backend)."""
         robot_scene.update(state.servo_angles, state.pitch, state.roll)
+        _refresh_ui()
+
+    # Register subscriber — unregister on page leave (NiceGUI handles cleanup via weak refs)
+    state.subscribe(on_telemetry)
 
     async def slow_update():
-        """2s: fetch slow data, sync balance switch + footer stability."""
+        """2s polling: fetch slow data that isn't in telemetry (gait/balance/stability details)."""
         await state.update_slow()
 
         balance_switch.value = state.balance_enabled
@@ -120,6 +128,11 @@ async def dashboard_page():
             STATUS_GREEN if state.balance_enabled else TEXT_MUTED,
         )
 
-    ui.timer(0.5, fast_update)      # was 0.2 (5Hz) → 0.5 (2Hz) reduce Pi load
-    ui.timer(0.5, scene_update)     # was 0.333 (3Hz) → 0.5 (2Hz)
+    async def fallback_fast():
+        """Fallback 0.5s polling: only active when WS is not connected."""
+        if not state.ws_connected:
+            await state.update_fast()
+            _refresh_ui()
+
+    ui.timer(0.5, fallback_fast)   # Only does work when WS is down
     ui.timer(2.0, slow_update)

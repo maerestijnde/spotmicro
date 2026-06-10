@@ -144,12 +144,10 @@ async def imu_page():
         "pose_": ACCENT_CYAN, "balance_": "#ff8800", "imu_": "#a371f7",
     }
 
-    # Timer: 5Hz fast IMU data + chart
-    async def update_imu_fast():
-        await state.update_fast()
-
+    def _refresh_imu_ui():
+        """Update knobs + badges from current state."""
         refs["connection_badge"].text = "Connected" if state.connected else "Disconnected"
-        refs["connection_badge"]._props["color"] = "green" if state.connected else "red"
+        refs["connection_badge"]._props["color"] = "green" if state.ws_connected else ("orange" if state.connected else "red")
         refs["connection_badge"].update()
         refs["pitch_footer"].text = f"P: {state.pitch:.1f}"
         refs["roll_footer"].text = f"R: {state.roll:.1f}"
@@ -158,6 +156,8 @@ async def imu_page():
         pitch_knob.value = round(state.pitch, 1)
         roll_knob.value = round(state.roll, 1)
 
+    def _update_chart():
+        """Redraw the IMU history chart from current state."""
         if state.time_history:
             t0 = state.time_history[0]
             t_end = state.time_history[-1]
@@ -198,7 +198,14 @@ async def imu_page():
                 chart.options["series"][0].pop("markLine", None)
             chart.update()
 
-    # Timer: 2s slow stability/balance
+    async def on_imu_telemetry(frame: dict):
+        """Called on each WS telemetry frame — update chart + UI."""
+        _refresh_imu_ui()
+        _update_chart()
+
+    state.subscribe(on_imu_telemetry)
+
+    # Timer: 2s slow stability/balance (polling OK — not time-critical)
     async def update_imu_slow():
         await state.update_slow()
 
@@ -215,5 +222,12 @@ async def imu_page():
         refs["stability_footer_badge"]._props["color"] = color_map.get(stab_color, "red")
         refs["stability_footer_badge"].update()
 
-    ui.timer(0.5, update_imu_fast)   # was 0.2 (5Hz) → 0.5 (2Hz)
+    async def fallback_imu_fast():
+        """Fallback polling when WS is down."""
+        if not state.ws_connected:
+            await state.update_fast()
+            _refresh_imu_ui()
+            _update_chart()
+
+    ui.timer(0.5, fallback_imu_fast)
     ui.timer(2.0, update_imu_slow)

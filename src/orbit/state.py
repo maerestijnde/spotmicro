@@ -2,15 +2,21 @@
 Orbit state management - RobotState dataclass and async API client.
 
 Ported from nicegui_app.py with enhancements for the Orbit UI.
+WebSocket telemetry subscription replaces fast polling for real-time data.
 """
 import os
 import time
 import socket
 import asyncio
+import json
+import logging
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Callable, List
 
 import httpx
+
+log = logging.getLogger("orbit.state")
 
 # ============================================================================
 # CONFIGURATION
@@ -48,6 +54,7 @@ def get_backend_url():
 
 
 API_URL = get_backend_url()
+WS_URL = API_URL.replace("http://", "ws://").replace("https://", "wss://") + "/ws/telemetry"
 
 # ============================================================================
 # ASYNC HTTP HELPERS
@@ -131,6 +138,88 @@ class RobotState:
     # Busy guards to prevent overlapping timer ticks
     _fast_updating: bool = False
     _slow_updating: bool = False
+
+    # E-stop state (from telemetry)
+    estop: bool = False
+
+    # Gait mode from telemetry
+    gait_mode: str = "angle"
+
+    # Shadow comparison
+    shadow_compare: bool = False
+    shadow_max: dict = field(default_factory=dict)  # {"hip": X, "knee": X, "ankle": X}
+
+    # WS connection state
+    ws_connected: bool = False
+
+    # Subscriber callbacks: list of async callables called on each telemetry frame
+    _telemetry_subscribers: List[Callable] = field(default_factory=list)
+    # Subscriber callbacks for discrete events
+    _event_subscribers: List[Callable] = field(default_factory=list)
+
+    def subscribe(self, callback: Callable):
+        """Register a coroutine called on every telemetry frame: async def cb(frame: dict)."""
+        if callback not in self._telemetry_subscribers:
+            self._telemetry_subscribers.append(callback)
+
+    def unsubscribe(self, callback: Callable):
+        if callback in self._telemetry_subscribers:
+            self._telemetry_subscribers.remove(callback)
+
+    def subscribe_events(self, callback: Callable):
+        """Register a coroutine called on discrete events: async def cb(event: dict)."""
+        if callback not in self._event_subscribers:
+            self._event_subscribers.append(callback)
+
+    async def _apply_telemetry(self, frame: dict):
+        """Update state fields from a telemetry frame received via WebSocket."""
+        self.connected = True
+        self.ws_connected = True
+        self.servo_angles = {int(k): v for k, v in frame.get("servos", {}).items()}
+        imu = frame.get("imu", {})
+        self.pitch = imu.get("pitch", self.pitch)
+        self.roll = imu.get("roll", self.roll)
+        now = time.time()
+        self.pitch_history.append(self.pitch)
+        self.roll_history.append(self.roll)
+        self.time_history.append(now)
+
+        gait = frame.get("gait", {})
+        self.walking = gait.get("running", self.walking)
+        self.gait_mode = gait.get("mode", self.gait_mode)
+        self.shadow_compare = gait.get("shadow_compare", self.shadow_compare)
+        if "shadow_max" in gait:
+            self.shadow_max = gait["shadow_max"]
+
+        stab = frame.get("stability", {})
+        self.stability_state = stab.get("state", self.stability_state)
+
+        self.estop = frame.get("estop", self.estop)
+
+        # Notify subscribers
+        for cb in list(self._telemetry_subscribers):
+            try:
+                await cb(frame)
+            except Exception as e:
+                log.debug(f"Telemetry subscriber error: {e}")
+
+    async def _apply_event(self, event: dict):
+        """Handle a discrete event message from the telemetry WebSocket."""
+        name = event.get("name", "")
+        data = event.get("data", {})
+        self.activity_log.append({
+            "timestamp": time.time(),
+            "tag": name,
+            "message": name.replace("_", " ").title(),
+        })
+        self.event_history.append({"t": time.time(), "tag": name})
+        if name.startswith("estop"):
+            self.estop = (name == "estop")
+        for cb in list(self._event_subscribers):
+            try:
+                await cb(event)
+            except Exception as e:
+                log.debug(f"Event subscriber error: {e}")
 
     @property
     def uptime(self) -> str:
@@ -223,6 +312,42 @@ class RobotState:
 
     def mark_slider_touched(self, channel: int):
         self.slider_touch_times[channel] = time.time()
+
+
+async def start_telemetry_ws():
+    """
+    Background asyncio task: connect to /ws/telemetry with auto-reconnect.
+    Updates `state` fields directly; subscribers are notified on each frame.
+    Falls back gracefully if the websockets library is not installed.
+    """
+    try:
+        import websockets
+    except ImportError:
+        log.warning("websockets library not installed — telemetry WS disabled, using polling fallback")
+        return
+
+    retry_delay = 2.0
+    while True:
+        try:
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=10) as ws:
+                log.info(f"Telemetry WS connected: {WS_URL}")
+                state.ws_connected = True
+                retry_delay = 2.0  # reset on success
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if msg.get("type") == "telemetry":
+                        await state._apply_telemetry(msg)
+                    elif msg.get("type") == "event":
+                        await state._apply_event(msg)
+        except Exception as e:
+            log.debug(f"Telemetry WS disconnected: {e} — retrying in {retry_delay}s")
+            state.ws_connected = False
+            state.connected = False
+        await asyncio.sleep(retry_delay)
+        retry_delay = min(retry_delay * 1.5, 30.0)  # exponential backoff, max 30s
 
 
 # Module-level singleton

@@ -118,12 +118,10 @@ async def servos_page():
                 ui.button("Release Servo", on_click=release_servo, color="orange").props("dense unelevated")
                 ui.button("Save as Neutral", on_click=save_neutral, color="green").props("dense unelevated")
 
-    # Timer: 5Hz update servo sliders from state
-    async def update_servos():
-        await state.update_fast()
-
+    def _refresh_servo_ui():
+        """Update servo sliders from current state."""
         refs["connection_badge"].text = "Connected" if state.connected else "Disconnected"
-        refs["connection_badge"]._props["color"] = "green" if state.connected else "red"
+        refs["connection_badge"]._props["color"] = "green" if state.ws_connected else ("orange" if state.connected else "red")
         refs["connection_badge"].update()
 
         refs["pitch_footer"].text = f"P: {state.pitch:.1f}"
@@ -137,4 +135,14 @@ async def servos_page():
                 if ch in servo_labels:
                     servo_labels[ch].text = str(int(angle))
 
-    ui.timer(0.5, update_servos)    # was 0.2 (5Hz) → 0.5 (2Hz)
+    async def on_servo_telemetry(frame: dict):
+        _refresh_servo_ui()
+
+    state.subscribe(on_servo_telemetry)
+
+    async def fallback_servo_update():
+        if not state.ws_connected:
+            await state.update_fast()
+            _refresh_servo_ui()
+
+    ui.timer(0.5, fallback_servo_update)

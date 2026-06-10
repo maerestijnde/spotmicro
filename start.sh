@@ -1,26 +1,13 @@
 #!/bin/bash
-# MicroSpot - Start backend + UI + PS4 Controller
-# Usage: ./start.sh [--orbit] [--nicegui] [--dash]
-#   --orbit     Use Orbit UI (modern NiceGUI dashboard)
-#   --nicegui   Use NiceGUI UI (WebSocket-driven, 3D via Three.js)
-#   --dash      Use Dash UI instead of Streamlit (better real-time)
+# MicroSpot - Start backend + Orbit UI + PS4 Controller
+# Usage: ./start.sh
 # Press Ctrl+C to stop all services
-
-USE_DASH=false
-USE_NICEGUI=false
-USE_ORBIT=false
-if [ "$1" == "--orbit" ]; then
-    USE_ORBIT=true
-elif [ "$1" == "--nicegui" ]; then
-    USE_NICEGUI=true
-elif [ "$1" == "--dash" ]; then
-    USE_DASH=true
-fi
 
 cd "$(dirname "$0")/src"
 
 echo "========================================"
 echo "   MicroSpot Control System v2.0"
+echo "   Orbit UI (NiceGUI)"
 echo "========================================"
 echo ""
 
@@ -70,49 +57,15 @@ else
 fi
 echo ""
 
-# Start UI (foreground)
-if [ "$USE_ORBIT" == "true" ]; then
-    echo "Starting Orbit UI (port 8502)..."
-    echo ""
-    echo "========================================"
-    echo "  Open: http://microspot:8502"
-    echo "  API:  http://microspot:8000/docs"
-    echo "  PS4:  Connect controller via Bluetooth"
-    echo "========================================"
-    echo ""
-    python3 orbit_app.py
-elif [ "$USE_NICEGUI" == "true" ]; then
-    echo "Starting NiceGUI UI (port 8502)..."
-    echo ""
-    echo "========================================"
-    echo "  Open: http://microspot:8502"
-    echo "  API:  http://microspot:8000/docs"
-    echo "  PS4:  Connect controller via Bluetooth"
-    echo "========================================"
-    echo ""
-    python3 nicegui_app.py
-elif [ "$USE_DASH" == "true" ]; then
-    echo "Starting Dash UI (port 8050)..."
-    echo ""
-    echo "========================================"
-    echo "  Open: http://microspot:8050"
-    echo "  API:  http://microspot:8000/docs"
-    echo "  PS4:  Connect controller via Bluetooth"
-    echo "========================================"
-    echo ""
-    python3 dash_app.py
-else
-    echo "Starting Streamlit UI (port 8501)..."
-    echo ""
-    echo "========================================"
-    echo "  Open: http://microspot:8501"
-    echo "  API:  http://microspot:8000/docs"
-    echo "  PS4:  Connect controller via Bluetooth"
-    echo "  TIP:  Use --nicegui or --dash for better real-time"
-    echo "========================================"
-    echo ""
-    streamlit run app.py --server.port 8501 --server.headless true
-fi
+echo "Starting Orbit UI (port 8502)..."
+echo ""
+echo "========================================"
+echo "  Open: http://microspot:8502"
+echo "  API:  http://microspot:8000/docs"
+echo "  PS4:  Connect controller via Bluetooth"
+echo "========================================"
+echo ""
+python3 orbit_app.py
 
 # Wait for processes
 wait

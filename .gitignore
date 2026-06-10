@@ -54,6 +54,7 @@ pytest_cache/
 # Environments
 .env
 .venv
+.venv*/
 env/
 venv/
 ENV/

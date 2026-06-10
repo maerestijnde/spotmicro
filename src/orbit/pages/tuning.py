@@ -20,6 +20,7 @@ async def tuning_page():
         tab_stand = ui.tab("Stand")
         tab_balance = ui.tab("Balance")
         tab_gait = ui.tab("Gait")
+        tab_ik = ui.tab("IK")
 
     with ui.tab_panels(tabs, value=tab_stand).classes("w-full"):
         # ---- Stand tab ----
@@ -144,6 +145,113 @@ async def tuning_page():
                             ui.notify(f"{n} preset applied", type="info")
 
                         ui.button(name, on_click=apply_preset).props("dense unelevated outline")
+
+        # ---- IK tab ----
+        with ui.tab_panel(tab_ik):
+            with ui.card().classes("w-full mb-3"):
+                ui.label("IK Parameters").classes("text-lg font-bold text-white mb-2")
+                ui.label("Foot trajectory geometry for IK-based gait mode").classes("text-sm mb-3").style(f"color: {TEXT_MUTED}")
+
+                ik_mode_data = await api_get("/api/gait/mode") or {}
+
+                ik_step_height = ui.slider(
+                    min=0.01, max=0.08,
+                    value=float(ik_mode_data.get("ik_step_height", 0.03)),
+                    step=0.005,
+                ).props("label label-always color=cyan dense")
+                ui.label("Step Height (meters)").classes("text-xs").style(f"color: {TEXT_MUTED}")
+
+                ik_stride_length = ui.slider(
+                    min=0.01, max=0.08,
+                    value=float(ik_mode_data.get("ik_stride_length", 0.04)),
+                    step=0.005,
+                ).props("label label-always color=cyan dense")
+                ui.label("Stride Length (meters)").classes("text-xs").style(f"color: {TEXT_MUTED}")
+
+                with ui.row().classes("gap-2 mt-4"):
+                    async def apply_ik_params():
+                        await api_post("/api/gait/params", {
+                            "ik_step_height": ik_step_height.value,
+                            "ik_stride_length": ik_stride_length.value,
+                        })
+                        ui.notify("IK params applied", type="info")
+
+                    async def save_ik_params():
+                        await api_post("/api/gait/params", {
+                            "ik_step_height": ik_step_height.value,
+                            "ik_stride_length": ik_stride_length.value,
+                        })
+                        await api_post("/api/tuning/ik_step_height", {"value": ik_step_height.value})
+                        await api_post("/api/tuning/ik_stride_length", {"value": ik_stride_length.value})
+                        ui.notify("IK params saved", type="positive")
+
+                    ui.button("Apply", on_click=apply_ik_params).props("dense unelevated outline").classes("flex-grow")
+                    ui.button("Save", on_click=save_ik_params, color="green").props("dense unelevated").classes("flex-grow")
+
+                # IK presets for incremental testing
+                ui.separator().classes("my-3")
+                ui.label("IK Test Presets").classes("text-gray-300 font-bold mb-1")
+                ui.label("Use in order — validate each step before moving to the next").classes("text-xs mb-2").style(f"color: {TEXT_MUTED}")
+                ik_presets = {
+                    "Minimal": {"ik_step_height": 0.015, "ik_stride_length": 0.02},
+                    "Slow":    {"ik_step_height": 0.025, "ik_stride_length": 0.03},
+                    "Normal":  {"ik_step_height": 0.03,  "ik_stride_length": 0.04},
+                }
+                with ui.row().classes("gap-2"):
+                    for name, params in ik_presets.items():
+                        async def apply_ik_preset(p=params, n=name):
+                            await api_post("/api/gait/params", p)
+                            ik_step_height.value = p["ik_step_height"]
+                            ik_stride_length.value = p["ik_stride_length"]
+                            ui.notify(f"IK preset '{n}' applied", type="info")
+                        ui.button(name, on_click=apply_ik_preset).props("dense unelevated outline")
+
+            # IK Stand Validation card
+            with ui.card().classes("w-full"):
+                ui.label("IK Stand Validation").classes("text-lg font-bold text-white mb-1")
+                ui.label(
+                    "Compares IK-computed neutral stand angles with the angle-based stand. "
+                    "Deviation >20° = investigate before switching to IK mode."
+                ).classes("text-xs mb-3").style(f"color: {TEXT_MUTED}")
+
+                validate_col = ui.column().classes("w-full")
+
+                async def run_ik_validate():
+                    validate_col.clear()
+                    with validate_col:
+                        ui.spinner(size="sm")
+                    data = await api_get("/api/gait/ik_stand")
+                    validate_col.clear()
+                    if not data or data.get("error"):
+                        with validate_col:
+                            ui.label(f"Error: {(data or {}).get('error', 'unreachable')}").classes("text-sm text-red-400")
+                        return
+                    ok = data.get("ok", False)
+                    max_dev = data.get("max_deviation", 0.0)
+                    ok_color = "#00ff88" if ok else "#ff2244"
+                    with validate_col:
+                        with ui.row().classes("items-center gap-2 mb-2"):
+                            ui.icon("check_circle" if ok else "cancel").style(f"color: {ok_color}; font-size:20px;")
+                            ui.label(
+                                f"{'PASS — safe to use IK mode' if ok else 'FAIL — do not switch to IK yet'}"
+                            ).classes("text-base font-bold").style(f"color: {ok_color}")
+                        ui.label(f"Max deviation: {max_dev:.1f}° (tolerance: {data.get('tolerance', 20)}°)").classes("text-sm").style(f"color: {TEXT_MUTED}")
+                        legs = data.get("legs", {})
+                        if legs:
+                            with ui.row().classes("gap-3 mt-2 flex-wrap"):
+                                for leg_id, leg_data in sorted(legs.items()):
+                                    with ui.card().classes("p-2"):
+                                        ui.label(leg_id).classes("text-sm font-bold text-white")
+                                        for joint in ["hip", "knee", "ankle"]:
+                                            d = leg_data.get("deviation", {}).get(joint, 0.0)
+                                            ik_v = leg_data.get("ik", {}).get(joint, 0.0)
+                                            ang_v = leg_data.get("angle_based", {}).get(joint, 0.0)
+                                            jc = "#00ff88" if d < 10 else ("#ff8800" if d < 25 else "#ff2244")
+                                            ui.label(
+                                                f"{joint}: IK {ik_v:.0f}° vs {ang_v:.0f}° (Δ{d:.0f}°)"
+                                            ).classes("text-xs").style(f"color: {jc}")
+
+                ui.button("Run Validation", on_click=run_ik_validate, color="blue").props("dense unelevated").classes("w-full")
 
     # Connection update timer
     async def update_connection():

@@ -207,6 +207,14 @@ servos = {}
 _servo_channel_map = {}  # channel -> servo.Servo object (built in init_servos)
 servo_angles = {i: 90 for i in range(12)}  # Only 12 servos (0-11)
 
+# E-stop flag — set True to immediately block all servo writes
+estop_active = False
+
+# Thread-safety locks
+import threading as _threading
+i2c_lock = _threading.RLock()    # Protects all PCA9685 hardware writes
+state_lock = _threading.RLock()  # Protects calibration, tuning_config, custom_poses, body_state
+
 
 def get_pca_and_channel(logical_channel: int):
     """
@@ -350,8 +358,8 @@ def load_custom_poses():
 def save_custom_poses():
     """Save custom poses to file"""
     poses_file = BASE_DIR / "custom_poses.json"
-    with open(poses_file, 'w') as f:
-        json.dump(custom_poses, f, indent=2)
+    with state_lock:
+        save_json_atomic(poses_file, custom_poses)
     print(f"✓ Custom poses saved ({len(custom_poses)} poses)")
 
 # Preset poses (kinematics-based with fallback angles)
@@ -439,12 +447,20 @@ def load_calibration():
         calibration = CalibrationProfile()
         print("⚠ No calibration file found - using defaults")
 
+def save_json_atomic(path: Path, data: dict):
+    """Write JSON atomically: write to .tmp then os.replace() to avoid corruption."""
+    tmp = Path(str(path) + ".tmp")
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
 def save_calibration():
     """Save calibration profile to file"""
     calib_file = BASE_DIR / "calibration.json"
-    calibration.calibration_date = datetime.datetime.now().isoformat()
-    with open(calib_file, 'w') as f:
-        json.dump(calibration.to_dict(), f, indent=2)
+    with state_lock:
+        calibration.calibration_date = datetime.datetime.now().isoformat()
+        save_json_atomic(calib_file, calibration.to_dict())
     print(f"✓ Calibration saved")
 
 # ============== TUNING PERSISTENCE ==============
@@ -481,10 +497,10 @@ def load_tuning():
 def save_tuning_to_file():
     """Save tuning parameters to file"""
     tuning_file = BASE_DIR / "tuning.json"
-    tuning_config["last_updated"] = datetime.datetime.now().isoformat()
-    tuning_config["version"] = "1.0"
-    with open(tuning_file, 'w') as f:
-        json.dump(tuning_config, f, indent=2)
+    with state_lock:
+        tuning_config["last_updated"] = datetime.datetime.now().isoformat()
+        tuning_config["version"] = "1.0"
+        save_json_atomic(tuning_file, tuning_config)
     print(f"✓ Tuning saved")
 
 def apply_tuning_to_gait():
@@ -564,22 +580,33 @@ def _check_pca_health():
             continue
         try:
             buf = bytearray(1)
-            with pca.i2c_device as i2c:
-                i2c.write_then_readinto(bytes([0x00]), buf)
-            if buf[0] & 0x10:  # SLEEP bit set = brownout reset
-                # Must clear SLEEP first - Adafruit's frequency setter preserves
-                # old MODE1 which includes the SLEEP bit from brownout state
+            with i2c_lock:
                 with pca.i2c_device as i2c:
-                    i2c.write(bytes([0x00, 0x00]))  # MODE1 = 0x00, clear SLEEP
-                time.sleep(0.005)  # Wait for oscillator to stabilize
-                pca.frequency = 50
-                log.warning(f"PCA9685 @ 0x{addr:02x} ({name}) brownout detected - re-initialized")
+                    i2c.write_then_readinto(bytes([0x00]), buf)
+                if buf[0] & 0x10:  # SLEEP bit set = brownout reset
+                    # Must clear SLEEP first - Adafruit's frequency setter preserves
+                    # old MODE1 which includes the SLEEP bit from brownout state
+                    with pca.i2c_device as i2c:
+                        i2c.write(bytes([0x00, 0x00]))  # MODE1 = 0x00, clear SLEEP
+                    time.sleep(0.005)  # Wait for oscillator to stabilize
+                    pca.frequency = 50
+                    log.warning(f"PCA9685 @ 0x{addr:02x} ({name}) brownout detected - re-initialized")
         except Exception as e:
             log.error(f"PCA health check 0x{addr:02x} failed: {e}")
+
+def disable_all_servos():
+    """Disable all 12 servo PWM outputs (e-stop: robot goes limp)."""
+    for ch in range(12):
+        disable_servo(ch)
+    log.warning("E-STOP: all servos disabled")
+
 
 def set_servo(channel, angle, apply_offset=True):
     """Set servo angle with optional calibration"""
     global _pca_check_counter
+    if estop_active:
+        return False
+
     _pca_check_counter += 1
     if _pca_check_counter >= _PCA_CHECK_INTERVAL:
         _pca_check_counter = 0
@@ -591,6 +618,10 @@ def set_servo(channel, angle, apply_offset=True):
         actual_angle = calibration.apply_to_angle(channel, angle)
     else:
         actual_angle = angle
+        # Still enforce per-servo limits even when bypassing calibration offsets
+        if calibration and channel in calibration.servos:
+            s = calibration.servos[channel]
+            actual_angle = max(s["min_angle"], min(s["max_angle"], actual_angle))
 
     actual_angle = max(0, min(180, actual_angle))  # 180° servo range
 
@@ -600,7 +631,8 @@ def set_servo(channel, angle, apply_offset=True):
     srv = _servo_channel_map.get(channel)
     if srv is not None:
         try:
-            srv.angle = actual_angle
+            with i2c_lock:
+                srv.angle = actual_angle
             return True
         except Exception as e:
             print(f"✗ Error ch{channel}: {e}")
@@ -695,9 +727,9 @@ def disable_servo(channel):
         # Setting bit 4 (0x10) in OFF_H register enables "full off" mode
         off_h_reg = 0x09 + 4 * physical_channel  # OFF_H register for this channel
 
-        # Use the i2c_device context manager to write directly
-        with pca_board.i2c_device as i2c:
-            i2c.write(bytes([off_h_reg, 0x10]))  # Set bit 4 (full off)
+        with i2c_lock:
+            with pca_board.i2c_device as i2c:
+                i2c.write(bytes([off_h_reg, 0x10]))  # Set bit 4 (full off)
 
         print(f"✓ Servo {channel} disabled (full off bit set)")
         return True
@@ -705,18 +737,17 @@ def disable_servo(channel):
         print(f"✗ Error disabling ch{channel} via register: {e}")
         # Fallback: try alternative method via pwm_out
         try:
-            # Set all ON/OFF registers to disable output completely
-            # ON_L=0, ON_H=0, OFF_L=0, OFF_H=0x10 (full off)
             base_reg = 0x06 + 4 * physical_channel
-            with pca_board.i2c_device as i2c:
-                i2c.write(bytes([base_reg, 0x00, 0x00, 0x00, 0x10]))
+            with i2c_lock:
+                with pca_board.i2c_device as i2c:
+                    i2c.write(bytes([base_reg, 0x00, 0x00, 0x00, 0x10]))
             print(f"✓ Servo {channel} disabled via full register write")
             return True
         except Exception as e2:
             print(f"✗ Fallback also failed: {e2}")
-            # Last resort: duty_cycle = 0 (still sends tiny pulse but minimal)
             try:
-                pca_board.channels[physical_channel].duty_cycle = 0
+                with i2c_lock:
+                    pca_board.channels[physical_channel].duty_cycle = 0
                 print(f"  Last resort: duty_cycle = 0")
                 return True
             except:
@@ -943,7 +974,21 @@ def reset_all():
     print("✓ Reset to 90°")
 
 def cleanup():
-    # Stop background IMU reader first to free I2C bus
+    global estop_active
+    estop_active = True  # Block any stray servo writes during shutdown
+    # Stop gait thread before disabling servos
+    if gait_controller:
+        try:
+            gait_controller.stop()
+        except:
+            pass
+    # Disable all servo PWM outputs so they go limp (safe state)
+    if HW:
+        try:
+            disable_all_servos()
+        except:
+            pass
+    # Stop background IMU reader to free I2C bus
     if gait_controller and gait_controller.balance:
         try:
             gait_controller.balance.stop_background_reader()
@@ -981,11 +1026,54 @@ def init_gait():
     try:
         gait_controller = GaitController(set_servo)
         _load_tuning()
+        # Hook IK failure events (only if IK was initialized by GaitController)
+        if gait_controller.ik_interface is not None:
+            def _on_ik_failure(leg_id: str, reason: str):
+                emit_event("ik_failure", {"leg": leg_id, "reason": reason})
+            gait_controller.ik_interface.on_failure = _on_ik_failure
         print("✓ Gait controller initialized")
         return True
     except Exception as e:
         print(f"✗ Gait init failed: {e}")
         return False
+
+def _stability_tiered_emergency():
+    """Tiered emergency callback for stability monitor.
+
+    CRITICAL is handled by the monitor calling this on EMERGENCY transition.
+    We do a full e-stop (PWM off) — if the robot is falling, powered servos
+    thrashing makes it worse.
+    """
+    global estop_active
+    log.warning("STABILITY EMERGENCY: robot critically tilted — activating e-stop")
+    estop_active = True
+    _emit_event("stability_emergency")
+    if gait_controller:
+        try:
+            gait_controller.stop()
+        except:
+            pass
+    if HW:
+        disable_all_servos()
+
+
+def _run_stability_update_thread():
+    """Daemon thread: reads cached IMU angles at 10Hz and feeds stability monitor."""
+    import threading
+    def _loop():
+        while True:
+            try:
+                if stability_monitor and gait_controller and gait_controller.balance:
+                    pitch, roll = gait_controller.balance.get_cached_angles()
+                    stability_monitor.update(pitch, roll)
+            except Exception:
+                pass
+            time.sleep(0.1)  # 10 Hz
+
+    t = threading.Thread(target=_loop, name="stability-update", daemon=True)
+    t.start()
+    return t
+
 
 def init_stability_monitor():
     """Initialize stability monitor for tracking robot orientation"""
@@ -994,13 +1082,9 @@ def init_stability_monitor():
         return False
 
     try:
-        # Wire emergency callback to stop gait when robot is critically tilted
-        emergency_cb = None
-        if GAIT_AVAILABLE and gait_controller:
-            emergency_cb = gait_controller.stop
-
-        stability_monitor = StabilityMonitor(emergency_callback=emergency_cb)
-        print("✓ Stability monitor initialized")
+        stability_monitor = StabilityMonitor(emergency_callback=_stability_tiered_emergency)
+        _run_stability_update_thread()
+        print("✓ Stability monitor initialized (10Hz background update)")
         return True
     except Exception as e:
         print(f"✗ Stability monitor init failed: {e}")
@@ -1160,6 +1244,45 @@ async def disable_servo_endpoint(channel: int):
     success = disable_servo(channel)
     return {"status": "ok" if success else "error", "channel": channel, "disabled": success}
 
+@app.post("/api/estop")
+def estop_endpoint():
+    """Emergency stop: immediately disable all servo PWM (robot goes limp).
+    This is a sync def so it runs in FastAPI's threadpool, allowing the
+    gait thread's blocking join() to complete without blocking the event loop.
+    """
+    global estop_active
+    estop_active = True  # Block servo writes first, before stopping the thread
+    _emit_event("estop")
+    if gait_controller:
+        try:
+            gait_controller.stop()
+        except Exception as e:
+            log.error(f"E-stop: gait stop error: {e}")
+    if HW:
+        disable_all_servos()
+    log.warning("E-STOP activated")
+    return {"status": "ok", "estop": True}
+
+@app.post("/api/estop/reset")
+def estop_reset_endpoint():
+    """Reset e-stop and smoothly move back to stand position."""
+    global estop_active
+    estop_active = False
+    _emit_event("estop_reset")
+    log.info("E-stop reset")
+    # Move to stand via smooth transition (set_servo is now unblocked)
+    try:
+        stand = POSES["stand"]["fallback_angles"]
+        move_all_servos_smooth(stand, duration_ms=1500, apply_offset=True)
+    except Exception as e:
+        log.warning(f"E-stop reset: could not move to stand: {e}")
+    return {"status": "ok", "estop": False}
+
+@app.get("/api/estop")
+def estop_status():
+    """Get current e-stop state."""
+    return {"estop": estop_active}
+
 @app.post("/api/leg/{leg_id}")
 async def set_leg_endpoint(leg_id: str, data: dict):
     """Set leg angles via REST API"""
@@ -1301,6 +1424,13 @@ async def single_step(data: dict = {}):
     gait_controller.single_step(direction)
     return {"status": "ok", "direction": direction}
 
+@app.post("/api/gait/heartbeat")
+async def gait_heartbeat():
+    """Refresh the gait watchdog timer. Call at least every 3s while gait is active."""
+    if gait_controller:
+        gait_controller.heartbeat()
+    return {"status": "ok"}
+
 @app.post("/api/gait/params")
 async def set_gait_params(data: dict):
     """Update gait parameters"""
@@ -1376,6 +1506,9 @@ async def set_gait_mode(data: dict = {}):
     if not GAIT_AVAILABLE or not gait_controller:
         return {"success": False, "error": "Gait controller not initialized"}
 
+    if gait_controller.is_running():
+        return {"success": False, "error": "Cannot switch mode while gait is running — stop first"}
+
     mode = data.get("mode", None)
     use_ik = data.get("use_ik", False)
     gait_type = data.get("gait_type", None)
@@ -1430,6 +1563,82 @@ def get_gait_mode():
         "ik_step_height": params.get("ik_step_height", 0.03),
         "ik_stride_length": params.get("ik_stride_length", 0.04)
     }
+
+@app.post("/api/gait/shadow")
+async def set_gait_shadow(data: dict = {}):
+    """Enable/disable shadow comparison mode (angle-mode computes IK alongside without applying).
+
+    Args:
+        data: {"enabled": bool}
+    Returns:
+        {"enabled": bool, "ik_available": bool}
+    """
+    if not GAIT_AVAILABLE or not gait_controller:
+        return {"error": "Gait controller not initialized"}
+    enabled = bool(data.get("enabled", False))
+    gait_controller.shadow_compare = enabled
+    ik_ok = bool(getattr(gait_controller, "ik_interface", None))
+    if enabled and not ik_ok:
+        try:
+            from ik_interface import IKInterface
+            from pathlib import Path
+            gait_controller.ik_interface = IKInterface(
+                calibration_path=str(Path(__file__).parent / "calibration.json"),
+                body_height=0.10,
+            )
+            ik_ok = True
+        except Exception as e:
+            gait_controller.shadow_compare = False
+            return {"enabled": False, "ik_available": False, "error": str(e)}
+    _emit_event(f"shadow_{'on' if enabled else 'off'}")
+    return {"enabled": gait_controller.shadow_compare, "ik_available": ik_ok}
+
+
+@app.get("/api/gait/compare")
+def get_gait_compare():
+    """Return current shadow-comparison divergence data (angle-mode vs IK, degrees per joint)."""
+    if not GAIT_AVAILABLE or not gait_controller:
+        return {"error": "Gait controller not initialized"}
+    divergence = gait_controller.get_shadow_divergence()
+    # Compute max divergence per joint across all legs
+    summary = {}
+    for joint in ["hip", "knee", "ankle"]:
+        vals = [divergence.get(leg, {}).get(joint, 0) for leg in ["FL", "FR", "RL", "RR"]]
+        summary[joint] = round(max(vals), 1) if vals else 0.0
+    # IK stats (if interface exists)
+    ik_stats = {}
+    if gait_controller.ik_interface and hasattr(gait_controller.ik_interface, "get_ik_stats"):
+        ik_stats = gait_controller.ik_interface.get_ik_stats()
+    return {
+        "shadow_compare": gait_controller.shadow_compare,
+        "divergence": divergence,
+        "summary": summary,
+        "ik_stats": ik_stats,
+    }
+
+
+@app.get("/api/gait/ik_stand")
+def get_ik_stand():
+    """Preview IK stand angles and compare with angle-based stand.
+
+    Returns validation report: ok, max_deviation, per-leg ik vs angle comparison.
+    """
+    if not GAIT_AVAILABLE or not gait_controller:
+        return {"ok": False, "error": "Gait controller not initialized"}
+    if not gait_controller.ik_interface:
+        # Lazy-init IK for validation without switching mode
+        try:
+            from ik_interface import IKInterface
+            from pathlib import Path
+            gait_controller.ik_interface = IKInterface(
+                calibration_path=str(Path(__file__).parent / "calibration.json"),
+                body_height=0.10,
+            )
+        except Exception as e:
+            return {"ok": False, "error": f"IK init failed: {e}"}
+    report = gait_controller.validate_ik_stand()
+    return report
+
 
 @app.post("/api/gait/crawl_params")
 async def set_crawl_params(data: dict):
@@ -2012,6 +2221,145 @@ def download_recording(filename: str):
     if filepath:
         return FileResponse(filepath, media_type="text/csv", filename=filename)
     return {"error": "File not found"}
+
+# ============== TELEMETRY WEBSOCKET ==============
+# Push-based real-time telemetry at 10Hz. Separate from the command /ws.
+# Clients receive two message types:
+#   {"type": "telemetry", "t": float, "servos": {...}, "imu": {...}, ...}
+#   {"type": "event", "name": str, "data": {...}}
+
+class _TelemetryConnectionManager:
+    """Manage connected telemetry WebSocket clients."""
+    def __init__(self):
+        self._clients: set = set()
+        self._lock = _threading.Lock()
+
+    def add(self, ws):
+        with self._lock:
+            self._clients.add(ws)
+
+    def remove(self, ws):
+        with self._lock:
+            self._clients.discard(ws)
+
+    async def broadcast(self, payload: dict):
+        import json as _json
+        text = _json.dumps(payload)
+        dead = set()
+        with self._lock:
+            clients = set(self._clients)
+        for ws in clients:
+            try:
+                await ws.send_text(text)
+            except Exception:
+                dead.add(ws)
+        for ws in dead:
+            self.remove(ws)
+
+
+_telemetry_manager = _TelemetryConnectionManager()
+_event_queue: asyncio.Queue = asyncio.Queue()
+
+
+def emit_event(name: str, data: dict = None):
+    """Emit a named event to all telemetry subscribers.
+    Thread-safe: callable from gait/balance/signal threads.
+    """
+    _emit_event(name)  # also log to in-memory buffer
+    payload = {"type": "event", "name": name, "data": data or {}}
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.call_soon_threadsafe(_event_queue.put_nowait, payload)
+    except Exception:
+        pass
+
+
+async def _telemetry_broadcast_loop():
+    """Background asyncio task: broadcasts telemetry at ~10Hz."""
+    while True:
+        # Drain events first (non-blocking)
+        while not _event_queue.empty():
+            try:
+                event = _event_queue.get_nowait()
+                await _telemetry_manager.broadcast(event)
+            except asyncio.QueueEmpty:
+                break
+
+        # Build telemetry snapshot
+        try:
+            imu = {"pitch": 0.0, "roll": 0.0}
+            if gait_controller and gait_controller.balance:
+                p, r = gait_controller.balance.get_cached_angles()
+                imu = {"pitch": round(p, 2), "roll": round(r, 2)}
+
+            gait_info = {"running": False, "mode": "angle", "direction": "forward"}
+            if gait_controller:
+                params = gait_controller.get_params()
+                gait_info = {
+                    "running": gait_controller.is_running(),
+                    "mode": ("crawl" if params.get("crawl_mode") else
+                             "generator" if params.get("generator_mode") else
+                             "ik" if params.get("use_ik") else "angle"),
+                    "direction": getattr(gait_controller, "direction", "forward"),
+                    "shadow_compare": params.get("shadow_compare", False),
+                }
+                # Include latest shadow divergence summary when active
+                if params.get("shadow_compare"):
+                    div = gait_controller.get_shadow_divergence()
+                    if div:
+                        summary = {}
+                        for joint in ["hip", "knee", "ankle"]:
+                            vals = [div.get(leg, {}).get(joint, 0) for leg in ["FL", "FR", "RL", "RR"]]
+                            summary[joint] = round(max(vals), 1) if vals else 0.0
+                        gait_info["shadow_max"] = summary
+                # Include IK stats when IK interface is present
+                if gait_controller.ik_interface and hasattr(gait_controller.ik_interface, "get_ik_stats"):
+                    gait_info["ik_stats"] = gait_controller.ik_interface.get_ik_stats()
+
+            stability_info = {"state": "unknown"}
+            if stability_monitor:
+                stability_info = {"state": stability_monitor.get_status().get("state", "unknown")}
+
+            payload = {
+                "type": "telemetry",
+                "t": time.time(),
+                "servos": dict(servo_angles),
+                "imu": imu,
+                "gait": gait_info,
+                "stability": stability_info,
+                "estop": estop_active,
+                "hw": HW,
+            }
+            await _telemetry_manager.broadcast(payload)
+        except Exception as e:
+            log.debug(f"Telemetry broadcast error: {e}")
+
+        await asyncio.sleep(0.1)  # 10 Hz
+
+
+@app.on_event("startup")
+async def _start_telemetry():
+    asyncio.create_task(_telemetry_broadcast_loop())
+
+
+@app.websocket("/ws/telemetry")
+async def telemetry_ws(websocket: WebSocket):
+    """WebSocket endpoint for real-time telemetry push (read-only)."""
+    await websocket.accept()
+    _telemetry_manager.add(websocket)
+    try:
+        while True:
+            # Keep connection alive; client sends pings or we rely on TCP keepalive
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+            except asyncio.TimeoutError:
+                pass  # No message is fine — we're push-only
+    except Exception:
+        pass
+    finally:
+        _telemetry_manager.remove(websocket)
+
 
 # ============== MAIN ==============
 

@@ -14,11 +14,14 @@ from orbit.theme import (
 )
 from orbit.state import api_get, api_post, state
 
+ESTOP_RED = "#dc2626"
+
 
 # Navigation items: (path, icon, label)
 NAV_ITEMS = [
     ("/", "dashboard", "Dashboard"),
     ("/servos", "precision_manufacturing", "Servos"),
+    ("/calibration", "manage_accounts", "Calibration"),
     ("/tuning", "tune", "Tuning"),
     ("/imu", "sensors", "IMU"),
     ("/settings", "settings", "Settings"),
@@ -29,7 +32,7 @@ def create_shell(page_title: str = "Dashboard") -> dict:
     """Build the full page shell and return updatable UI refs.
 
     Returns dict with keys:
-        connection_badge, rec_btn,
+        connection_badge, rec_btn, header_row,
         stability_footer_badge, pitch_footer, roll_footer, uptime_label
     """
     apply_theme()
@@ -37,9 +40,12 @@ def create_shell(page_title: str = "Dashboard") -> dict:
     refs = {}
 
     # ------------------------------------------------------------------ Header
-    with ui.header().classes("items-center justify-between px-4").style(
+    header = ui.header().classes("items-center justify-between px-4").style(
         f"height: 48px; background: {BG_SIDEBAR}; border-bottom: 1px solid {BORDER_COLOR};"
-    ):
+    )
+    refs["header"] = header
+
+    with header:
         with ui.row().classes("items-center gap-3"):
             ui.icon("pets").classes("text-lg").style(f"color: {ACCENT_CYAN}")
             ui.label("MicroSpot").classes("text-base font-bold").style(f"color: {TEXT_PRIMARY}")
@@ -75,16 +81,64 @@ def create_shell(page_title: str = "Dashboard") -> dict:
 
             refs["rec_btn"].on_click(toggle_rec)
 
-            # Emergency stop
-            async def emergency_stop():
-                await api_post("/api/gait/stop")
-                for ch in range(12):
-                    await api_post(f"/api/servo/{ch}/disable")
-                ui.notify("EMERGENCY STOP - All servos disabled!", type="negative", position="top")
+            # ---- E-STOP (hardware emergency stop — no confirm dialog, must be instant) ----
+            refs["estop_btn"] = ui.button(
+                "⚡ E-STOP",
+                color="red",
+            ).props("dense unelevated size=sm").classes("font-bold px-3").style(
+                f"background: {ESTOP_RED} !important; color: white; letter-spacing: 0.05em;"
+            )
 
-            ui.button("STOP", on_click=emergency_stop, color="red").props(
-                "dense unelevated size=sm"
-            ).classes("emergency-btn text-white font-bold")
+            async def do_estop():
+                result = await api_post("/api/estop")
+                ui.notify(
+                    "⚡ E-STOP ACTIVATED — All servos disabled!",
+                    type="negative",
+                    position="top",
+                    timeout=0,  # persistent until dismissed
+                )
+
+            refs["estop_btn"].on_click(do_estop)
+
+            # ---- Reset e-stop (confirm dialog) ----
+            refs["estop_reset_btn"] = ui.button(
+                "Reset", color="orange"
+            ).props("dense unelevated size=sm").classes("font-bold").style(
+                "display: none;"
+            )
+
+            async def do_estop_reset():
+                with ui.dialog() as confirm_dialog, ui.card():
+                    ui.label("Reset E-Stop?").classes("text-base font-bold")
+                    ui.label("Robot will move to stand position. Make sure it is safe to power servos.").classes("text-sm mt-1")
+                    with ui.row().classes("gap-2 mt-3"):
+                        async def confirmed():
+                            confirm_dialog.close()
+                            await api_post("/api/estop/reset")
+                            ui.notify("E-stop reset — robot returning to stand", type="positive")
+                        ui.button("Confirm Reset", on_click=confirmed, color="orange").props("dense unelevated")
+                        ui.button("Cancel", on_click=confirm_dialog.close).props("dense unelevated outline")
+                confirm_dialog.open()
+
+            refs["estop_reset_btn"].on_click(do_estop_reset)
+
+            # Subscribe to telemetry for estop state changes
+            async def on_estop_telemetry(frame: dict):
+                is_estop = frame.get("estop", False)
+                if is_estop:
+                    refs["header"].style(
+                        f"height: 48px; background: {ESTOP_RED}; border-bottom: 2px solid #ff6666;"
+                    )
+                    refs["estop_reset_btn"].style("display: inline-block;")
+                else:
+                    refs["header"].style(
+                        f"height: 48px; background: {BG_SIDEBAR}; border-bottom: 1px solid {BORDER_COLOR};"
+                    )
+                    refs["estop_reset_btn"].style("display: none;")
+                refs["header"].update()
+                refs["estop_reset_btn"].update()
+
+            state.subscribe(on_estop_telemetry)
 
     # ------------------------------------------------------------- Mini-sidebar
     with ui.left_drawer(value=True).props("mini mini-to-overlay bordered").classes("p-0").style(

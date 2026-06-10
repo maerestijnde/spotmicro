@@ -10,6 +10,7 @@ Supports two modes:
 import time
 import math
 import threading
+from collections import deque
 from typing import Callable, Optional
 from pathlib import Path
 
@@ -220,6 +221,19 @@ class GaitController:
         # Lateral rate for side stepping (-1.0 = full left, 1.0 = full right)
         self.lateral_rate = 0.0
 
+        # Heartbeat watchdog: auto-stop if no command received for WATCHDOG_TIMEOUT seconds
+        self.WATCHDOG_TIMEOUT = 3.0
+        self.last_command_time: float = time.monotonic()
+
+        # Shadow comparison: compute IK angles alongside angle-mode (no servo writes)
+        self.shadow_compare: bool = False
+        self._shadow_tick: int = 0
+        self._shadow_buffer = {
+            leg: {joint: deque(maxlen=50) for joint in ["hip", "knee", "ankle"]}
+            for leg in ["FL", "FR", "RL", "RR"]
+        }
+        self._shadow_divergence: dict = {}  # latest per-leg, per-joint divergence (degrees)
+
         # Balance controller (IMU)
         self.balance = None
         self.use_balance = False
@@ -406,6 +420,10 @@ class GaitController:
                 self.gait_generator.cpg.config.base_frequency = 1.0 / self.params["cycle_time"]
                 self.gait_generator.set_speed(self.params["speed"])
 
+    def heartbeat(self):
+        """Refresh the watchdog timer. Call this from any active controller or UI to signal liveness."""
+        self.last_command_time = time.monotonic()
+
     def set_turn_rate(self, rate: float):
         """
         Set the turn rate for steering while walking.
@@ -417,6 +435,7 @@ class GaitController:
                   Positive = turn right (right legs take shorter steps)
         """
         self.turn_rate = max(-1.0, min(1.0, rate))
+        self.last_command_time = time.monotonic()
         if DEBUG and abs(rate) > 0.1:
             print(f"  Turn rate: {self.turn_rate:.2f}")
 
@@ -427,10 +446,12 @@ class GaitController:
         Args:
             rate: Lateral rate from -1.0 (full left) to 1.0 (full right)
                   0.0 = no lateral movement
+
                   Negative = step left
                   Positive = step right
         """
         self.lateral_rate = max(-1.0, min(1.0, rate))
+        self.last_command_time = time.monotonic()
         if DEBUG and abs(rate) > 0.1:
             print(f"  Lateral rate: {self.lateral_rate:.2f}")
 
@@ -524,7 +545,12 @@ class GaitController:
         result["ik_available"] = IK_AVAILABLE
         result["crawl_mode"] = self.crawl_mode
         result["generator_mode"] = self.generator_mode
+        result["shadow_compare"] = self.shadow_compare
         return result
+
+    def get_shadow_divergence(self) -> dict:
+        """Return latest per-leg, per-joint angle divergence (angle-mode vs IK)."""
+        return self._shadow_divergence.copy()
 
     def _smooth_phase(self, t: float) -> float:
         """
@@ -829,6 +855,46 @@ class GaitController:
             }
         return result
 
+    def _compute_shadow_tick(self, cycle_phase: float):
+        """Compute IK angles for current phase without moving servos (shadow compare).
+        Only called every 5th tick in angle-mode when shadow_compare is enabled."""
+        if not (IK_AVAILABLE and self.ik_interface):
+            return
+        try:
+            divergence = {}
+            for leg_id in self.legs:
+                in_pair_a = leg_id in self.pair_a
+                if cycle_phase < 0.5:
+                    if in_pair_a:
+                        p = self._smooth_phase(cycle_phase * 2)
+                        ang = self._leg_angles_swing(p, leg_id)
+                        ik = self._leg_angles_swing_ik(p, leg_id)
+                    else:
+                        p = cycle_phase * 2
+                        ang = self._leg_angles_stance(p, leg_id)
+                        ik = self._leg_angles_stance_ik(p, leg_id)
+                else:
+                    if in_pair_a:
+                        p = (cycle_phase - 0.5) * 2
+                        ang = self._leg_angles_stance(p, leg_id)
+                        ik = self._leg_angles_stance_ik(p, leg_id)
+                    else:
+                        p = self._smooth_phase((cycle_phase - 0.5) * 2)
+                        ang = self._leg_angles_swing(p, leg_id)
+                        ik = self._leg_angles_swing_ik(p, leg_id)
+
+                divergence[leg_id] = {
+                    joint: round(abs(ik[joint] - ang[joint]), 1)
+                    for joint in ["hip", "knee", "ankle"]
+                }
+                for joint in ["hip", "knee", "ankle"]:
+                    self._shadow_buffer[leg_id][joint].append(divergence[leg_id][joint])
+
+            self._shadow_divergence = divergence
+        except Exception as e:
+            if DEBUG:
+                print(f"Shadow compare error: {e}")
+
     def _gait_loop(self):
         """Main gait loop - runs in separate thread"""
         print(f"\n{'=' * 60}")
@@ -850,6 +916,12 @@ class GaitController:
         last_phase_half = -1
 
         while self.running:
+            # Watchdog: auto-stop if no command received within timeout
+            if time.monotonic() - self.last_command_time > self.WATCHDOG_TIMEOUT:
+                print(f"GAIT WATCHDOG: no command for {self.WATCHDOG_TIMEOUT}s, stopping")
+                self.running = False
+                break
+
             # Read IMU once per iteration (not per leg)
             self._update_balance_corrections()
 
@@ -877,6 +949,12 @@ class GaitController:
                     else:
                         print(f">> FR+RL lift, FL+RR ground")
                     last_phase_half = current_half
+
+                # Shadow compare: every 5th tick compute IK angles without applying them
+                if self.shadow_compare and not self.use_ik:
+                    self._shadow_tick += 1
+                    if self._shadow_tick % 5 == 0:
+                        self._compute_shadow_tick(cycle_phase)
 
                 if cycle_phase < 0.5:
                     swing_phase = self._smooth_phase(cycle_phase * 2)
@@ -927,6 +1005,80 @@ class GaitController:
             self._apply_leg_angles(leg_id, angles)
         print(f"{'=' * 60}\n")
 
+    def _compute_ik_stand_angles(self) -> dict:
+        """Compute stand angles for neutral foot positions via IK.
+
+        Returns {leg_id: {hip, knee, ankle}} on success, {} on failure.
+        Uses IKInterface.feet_to_angles which solves all 4 legs simultaneously.
+        """
+        if not self.ik_interface:
+            return {}
+        try:
+            neutral_feet = self.ik_interface.get_neutral_foot_positions()
+            raw = self.ik_interface.feet_to_angles(neutral_feet)
+            return {
+                leg: {"hip": round(a[0], 1), "knee": round(a[1], 1), "ankle": round(a[2], 1)}
+                for leg, a in raw.items()
+            }
+        except Exception as e:
+            print(f"IK stand computation failed: {e}")
+            return {}
+
+    def validate_ik_stand(self, tolerance_deg: float = 20.0) -> dict:
+        """Compare IK stand angles with angle-based stand angles.
+
+        Returns a report dict:
+          {"ok": bool, "max_deviation": float, "tolerance": float,
+           "legs": {leg: {ik, angle, deviation, max_dev}},
+           "ik_angles": {...}, "error": str (only on failure)}
+        """
+        ik_angles = self._compute_ik_stand_angles()
+        if not ik_angles:
+            return {"ok": False, "error": "IK stand computation failed", "ik_available": IK_AVAILABLE}
+
+        report: dict = {"ok": True, "legs": {}, "max_deviation": 0.0, "tolerance": tolerance_deg,
+                        "ik_available": IK_AVAILABLE, "ik_angles": ik_angles}
+        for leg_id in self.legs:
+            ik = ik_angles.get(leg_id)
+            if not ik:
+                continue
+            ang = self.stand_angles[leg_id]
+            dev = {j: round(abs(ik[j] - ang[j]), 1) for j in ["hip", "knee", "ankle"]}
+            max_dev = max(dev.values())
+            report["legs"][leg_id] = {"ik": ik, "angle_based": ang, "deviation": dev, "max_dev": max_dev}
+            report["max_deviation"] = max(report["max_deviation"], max_dev)
+            if max_dev > tolerance_deg:
+                report["ok"] = False
+
+        return report
+
+    def goto_stand_ik(self, tolerance_deg: float = 20.0) -> bool:
+        """Move to stand position using IK-computed angles.
+
+        Falls back to angle-based stand when IK is unavailable or deviation is too large.
+        Returns True if IK stand was applied, False if fell back to angle-based.
+        """
+        report = self.validate_ik_stand(tolerance_deg)
+        if not report.get("ok"):
+            max_dev = report.get("max_deviation", 0.0)
+            err = report.get("error", "")
+            print(f"IK stand validation failed "
+                  f"({'max deviation ' + str(max_dev) + '° > ' + str(tolerance_deg) + '°' if not err else err})"
+                  f" — falling back to angle-based stand")
+            self.goto_stand()
+            return False
+
+        ik_angles = report["ik_angles"]
+        print(f"\n{'=' * 60}")
+        print(f"GOING TO IK STAND  (max deviation {report['max_deviation']:.1f}°)")
+        print(f"{'=' * 60}")
+        self._update_balance_corrections()
+        for leg_id, angles in ik_angles.items():
+            print(f"  {leg_id}: hip={angles['hip']:.0f}, knee={angles['knee']:.0f}, ankle={angles['ankle']:.0f}")
+            self._apply_leg_angles(leg_id, angles)
+        print(f"{'=' * 60}\n")
+        return True
+
     def start(self, direction: str = "forward"):
         """Start the gait - first goes to STAND position, then starts walking"""
         if self.running:
@@ -936,10 +1088,15 @@ class GaitController:
         if self.crawl_mode and self.crawl_controller:
             return self.crawl_controller.start(direction)
 
-        self.goto_stand()
+        # IK mode uses IK-computed stand angles; generator mode keeps angle stand (uses CPG)
+        if self.use_ik and not self.generator_mode:
+            self.goto_stand_ik()
+        else:
+            self.goto_stand()
         time.sleep(0.3)
 
         self.direction = direction
+        self.last_command_time = time.monotonic()  # Reset watchdog on start
         if self.generator_mode and self.gait_generator:
             self.gait_generator.set_direction(direction)
             self.gait_generator.reset_phases()

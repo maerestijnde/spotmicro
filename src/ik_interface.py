@@ -58,6 +58,12 @@ class IKInterface:
             'RR': [90.0, 90.0, 90.0],
         }
 
+        # Observability counters
+        self.failure_count: int = 0
+        self.clamp_count: int = 0
+        self.last_failure: str = ""
+        self.on_failure = None  # Optional[Callable[[str, str], None]] — called as on_failure(leg_id, reason)
+
     def _load_calibration(self, path):
         try:
             with open(path) as f:
@@ -161,6 +167,7 @@ class IKInterface:
         # Validate workspace and clamp if needed
         if not self._is_workspace_valid(leg_id, x, y, z):
             x, y, z = self._clamp_to_workspace(leg_id, x, y, z)
+            self.clamp_count += 1
 
         try:
             leg_name = self.LEG_NAME_MAP[leg_id]
@@ -194,13 +201,28 @@ class IKInterface:
             return angles
 
         except Exception as e:
-            # Return cached last-good solution instead of crashing
             import logging
+            reason = f"{type(e).__name__}: {e}"
+            self.failure_count += 1
+            self.last_failure = reason
             logging.getLogger("microspot.ik").warning(
-                f"IK failed for {leg_id} at ({x:.3f}, {y:.3f}, {z:.3f}): {e}. "
+                f"IK failed for {leg_id} at ({x:.3f}, {y:.3f}, {z:.3f}): {reason}. "
                 f"Using cached solution: {self._last_good_angles[leg_id]}"
             )
+            if self.on_failure is not None:
+                try:
+                    self.on_failure(leg_id, reason)
+                except Exception:
+                    pass
             return self._last_good_angles[leg_id].copy()
+
+    def get_ik_stats(self) -> dict:
+        """Return observability counters."""
+        return {
+            "failure_count": self.failure_count,
+            "clamp_count": self.clamp_count,
+            "last_failure": self.last_failure,
+        }
 
     def feet_to_angles(self, foot_positions):
         coords = np.array([foot_positions['RR'], foot_positions['FR'],

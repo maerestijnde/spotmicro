@@ -10,12 +10,18 @@ Usage:
     Open http://localhost:8502
 """
 
+import asyncio
 from nicegui import ui, app
 
 # Import all pages to register @ui.page routes
 import orbit.pages  # noqa: F401
 
-from orbit.state import http_client
+from orbit.state import http_client, start_telemetry_ws
+
+
+async def _startup():
+    """Start telemetry WebSocket connection on app startup."""
+    asyncio.create_task(start_telemetry_ws())
 
 
 async def _shutdown():
@@ -23,6 +29,7 @@ async def _shutdown():
         await http_client.aclose()
 
 
+app.on_startup(_startup)
 app.on_shutdown(_shutdown)
 
 if __name__ in {"__main__", "__mp_main__"}:
