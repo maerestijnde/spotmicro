@@ -1748,4 +1748,5 @@ if __name__ in {"__main__", "__mp_main__"}:
         reload=False,
         show=False,
         favicon="🐕",
+        storage_secret="microspot-secret-key",
     )
